@@ -1,4 +1,3 @@
-import json
 import math
 import re
 from datetime import datetime
@@ -10,18 +9,17 @@ import requests
 import yfinance as yf
 from bs4 import BeautifulSoup
 
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (MorningBriefingBot/21.0; +https://github.com/)"
-}
-
 TODAY = datetime.now().strftime("%Y-%m-%d")
 
-# ====== 可調整 ======
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (MorningBriefingBot/21.1; +https://github.com/)",
+    "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+}
+
 STOCKS = [
-    {"name": "台積電", "code": "2330.TW"},
-    {"name": "聯發科", "code": "2454.TW"},
-    {"name": "廣達", "code": "2382.TW"},
+    {"name": "台積電", "ticker": "2330.TW"},
+    {"name": "聯發科", "ticker": "2454.TW"},
+    {"name": "廣達", "ticker": "2382.TW"},
 ]
 
 NEWS_TOPICS = [
@@ -30,23 +28,23 @@ NEWS_TOPICS = [
     ("etf", "ETF 台灣 OR 美股ETF 台灣"),
 ]
 
-WEATHER_SOURCES = [
-    {
-        "city": "桃園",
-        "url": "https://www.cwa.gov.tw/V8/C/W/Town/Town.html?TID=6800100",
-    },
-    {
-        "city": "宜蘭五結",
-        "url": "https://www.cwa.gov.tw/V8/C/W/Town/Town.html?TID=1000209",
-    },
+WEATHER_POINTS = [
+    {"city": "桃園", "lat": 24.9936, "lon": 121.3009},
+    {"city": "宜蘭五結", "lat": 24.6840, "lon": 121.7990},
 ]
 
 
-def fetch_text(url: str, timeout: int = 15) -> str:
-    resp = requests.get(url, headers=HEADERS, timeout=timeout)
-    resp.raise_for_status()
-    resp.encoding = "utf-8"
-    return resp.text
+def fetch_json(url: str, timeout: int = 20):
+    r = requests.get(url, headers=HEADERS, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+
+def fetch_text(url: str, timeout: int = 20):
+    r = requests.get(url, headers=HEADERS, timeout=timeout)
+    r.raise_for_status()
+    r.encoding = "utf-8"
+    return r.text
 
 
 def safe_float(v, default=0.0):
@@ -65,69 +63,58 @@ def clamp(n, low, high):
 
 
 # =========================
-# 🌤 天氣：中央氣象署頁面抓取
+# 🌤 天氣（穩定版）
 # =========================
-def extract_weather_from_cwa(html: str, city_name: str) -> dict:
-    soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text("\n", strip=True)
-
-    # 優先抓「資料 / 溫度 / 降雨機率」
-    temp = None
-    rain = None
-    desc = ""
-
-    # 抓第一個「資料 ... 溫度 xx」
-    m_temp = re.search(r"資料[\s\S]{0,300}?溫度\s+(\d{1,2})", text)
-    if m_temp:
-        temp = f"{m_temp.group(1)}°C"
-
-    # 抓較接近現況的第一個降雨機率
-    m_rain = re.search(r"降雨機率\s+(\d{1,3})%", text)
-    if m_rain:
-        rain = f"{m_rain.group(1)}%"
-
-    # 抓描述
-    m_desc = re.search(rf"{re.escape(city_name)}[\s\S]{{0,120}}?([^\n]*降雨機率[^\n]*)", text)
-    if m_desc:
-        desc = m_desc.group(1).strip()
-
-    if not desc:
-        # 從 meta / title 補
-        meta_desc = soup.find("meta", attrs={"name": "description"})
-        if meta_desc and meta_desc.get("content"):
-            desc = meta_desc["content"].strip()
+def get_weather(lat: float, lon: float) -> dict:
+    url = (
+        "https://api.open-meteo.com/v1/forecast"
+        f"?latitude={lat}&longitude={lon}"
+        "&current=temperature_2m,precipitation_probability,weather_code"
+        "&timezone=Asia%2FTaipei"
+    )
+    data = fetch_json(url, timeout=20)
+    current = data.get("current", {})
+    temp = current.get("temperature_2m")
+    rain = current.get("precipitation_probability")
 
     return {
-        "city": city_name,
-        "temp": temp or "--°C",
-        "rain": rain or "--%",
-        "desc": desc or f"降雨 {rain or '--%'}",
-        "source": "CWA",
+        "temp": f"{temp:.1f}°C" if isinstance(temp, (int, float)) else "--°C",
+        "rain": f"{int(round(rain))}%" if isinstance(rain, (int, float)) else "--%",
+        "raw_temp": temp if isinstance(temp, (int, float)) else None,
+        "raw_rain": rain if isinstance(rain, (int, float)) else None,
+        "source": "Open-Meteo",
     }
 
 
 def get_weather_list():
-    results = []
-    for item in WEATHER_SOURCES:
+    result = []
+    for item in WEATHER_POINTS:
         try:
-            html = fetch_text(item["url"])
-            results.append(extract_weather_from_cwa(html, item["city"]))
+            w = get_weather(item["lat"], item["lon"])
+            result.append({
+                "city": item["city"],
+                "temp": w["temp"],
+                "rain": w["rain"],
+                "desc": f"降雨 {w['rain']}",
+                "source": w["source"],
+            })
         except Exception as e:
-            results.append({
+            result.append({
                 "city": item["city"],
                 "temp": "--°C",
                 "rain": "--%",
                 "desc": f"資料取得中 ({type(e).__name__})",
-                "source": "CWA",
+                "source": "Open-Meteo",
             })
-    return results
+    return result
 
 
 # =========================
-# 📰 新聞：Google News RSS
+# 📰 新聞
 # =========================
 def clean_news_title(title: str) -> str:
     title = re.sub(r"\s*-\s*[^-]+$", "", title).strip()
+    title = re.sub(r"\s+", " ", title)
     return title
 
 
@@ -137,12 +124,18 @@ def get_news(keyword: str, limit: int = 3):
     feed = feedparser.parse(url)
 
     items = []
-    for entry in feed.entries[:limit]:
+    seen = set()
+    for entry in feed.entries:
+        title = clean_news_title(getattr(entry, "title", "").strip())
+        if not title or title in seen:
+            continue
+        seen.add(title)
         items.append({
-            "title": clean_news_title(entry.title),
+            "title": title,
             "link": getattr(entry, "link", ""),
-            "source": getattr(entry, "source", {}).get("title", "") if getattr(entry, "source", None) else "",
         })
+        if len(items) >= limit:
+            break
     return items
 
 
@@ -157,7 +150,7 @@ def get_all_news():
 
 
 # =========================
-# 📈 股票：yfinance + 技術面 AI評分
+# 📈 股票 AI 分析
 # =========================
 def rsi(series, period=14):
     delta = series.diff()
@@ -179,38 +172,35 @@ def calc_macd(close):
 
 def analyze_stock(name: str, ticker: str):
     try:
-        df = yf.download(
-            ticker,
-            period="3mo",
-            interval="1d",
-            auto_adjust=False,
-            progress=False,
-            threads=False,
-        )
+        # 改用 Ticker().history()，避免 download() 常見 MultiIndex / TypeError 問題
+        hist = yf.Ticker(ticker).history(period="3mo", interval="1d", auto_adjust=False)
 
-        if df is None or df.empty or len(df) < 35:
+        if hist is None or hist.empty or len(hist) < 35:
             raise ValueError("not enough price history")
 
-        close = df["Close"].astype(float).dropna()
-        vol = df["Volume"].astype(float).fillna(0)
+        close = hist["Close"].astype(float).dropna()
+        vol = hist["Volume"].astype(float).fillna(0)
+
+        if len(close) < 35:
+            raise ValueError("not enough close series")
 
         last = float(close.iloc[-1])
         prev = float(close.iloc[-2])
-        day_change = ((last - prev) / prev) * 100 if prev else 0
+        day_change = ((last - prev) / prev) * 100 if prev else 0.0
 
-        ma5 = close.rolling(5).mean().iloc[-1]
-        ma10 = close.rolling(10).mean().iloc[-1]
-        ma20 = close.rolling(20).mean().iloc[-1]
+        ma5 = float(close.rolling(5).mean().iloc[-1])
+        ma10 = float(close.rolling(10).mean().iloc[-1])
+        ma20 = float(close.rolling(20).mean().iloc[-1])
 
         rsi14 = float(rsi(close, 14).iloc[-1])
 
-        macd, signal, hist = calc_macd(close)
-        hist_now = float(hist.iloc[-1])
-        hist_prev = float(hist.iloc[-2])
+        macd, signal, histv = calc_macd(close)
+        hist_now = float(histv.iloc[-1])
+        hist_prev = float(histv.iloc[-2])
 
-        vol5 = vol.rolling(5).mean().iloc[-1]
-        vol20 = vol.rolling(20).mean().iloc[-1]
-        vol_ratio = float(vol5 / vol20) if vol20 else 1.0
+        vol5 = float(vol.rolling(5).mean().iloc[-1])
+        vol20 = float(vol.rolling(20).mean().iloc[-1]) if float(vol.rolling(20).mean().iloc[-1]) != 0 else 1.0
+        vol_ratio = vol5 / vol20
 
         price_above_ma20 = last > ma20
         price_above_ma5 = last > ma5
@@ -266,12 +256,11 @@ def analyze_stock(name: str, ticker: str):
             "change_pct": round(day_change, 2),
             "signal": signal_text,
             "reason": reason,
-            "win_rate": score,   # 這是模型分數，不是假裝未來保證
+            "win_rate": score,
             "emoji": emoji,
             "rsi14": round(rsi14, 1),
-            "ma5": round(float(ma5), 2),
-            "ma20": round(float(ma20), 2),
         }
+
     except Exception as e:
         return {
             "name": name,
@@ -283,68 +272,86 @@ def analyze_stock(name: str, ticker: str):
             "win_rate": 50,
             "emoji": "⚪",
             "rsi14": 0,
-            "ma5": 0,
-            "ma20": 0,
         }
 
 
 def get_stocks():
-    return [analyze_stock(s["name"], s["code"]) for s in STOCKS]
+    return [analyze_stock(s["name"], s["ticker"]) for s in STOCKS]
 
 
 # =========================
-# 🚗 國五路況：高速公路1968官方頁面
+# 🚗 國五路況（多端點 fallback）
 # =========================
 def normalize_traffic_status(text: str) -> str:
     t = text.replace("　", " ").strip()
-    if any(x in t for x in ["壅塞", "回堵", "事故", "車禍"]):
+    if any(x in t for x in ["壅塞", "回堵", "事故", "車禍", "封閉"]):
         return "壅塞"
-    if any(x in t for x in ["車多", "行車量大", "旅行時間增加"]):
+    if any(x in t for x in ["車多", "行車量大", "旅行時間增加", "施工"]):
         return "車多"
     return "順暢"
 
 
+def parse_n5_lines(text: str):
+    lines = []
+    for raw in text.splitlines():
+        line = re.sub(r"\s+", " ", raw).strip()
+        if not line:
+            continue
+        if any(k in line for k in ["國道5", "國5", "雪隧", "頭城", "坪林", "石碇", "南港系統"]):
+            if len(line) >= 6:
+                lines.append(line)
+    return list(dict.fromkeys(lines))
+
+
 def get_traffic():
-    url = "https://1968.freeway.gov.tw/tp_future"
-    try:
-        html = fetch_text(url, timeout=20)
-        soup = BeautifulSoup(html, "html.parser")
-        text = soup.get_text("\n", strip=True)
+    urls = [
+        "https://1968.freeway.gov.tw/roadinfo?freeway=5",
+        "https://1968.freeway.gov.tw/n_notify",
+        "https://1968.freeway.gov.tw/",
+    ]
 
-        notes = []
-        for line in text.splitlines():
-            line = line.strip()
-            if "國道5號" in line or "國5" in line or "頭城" in line or "坪林" in line or "雪隧" in line:
-                if len(line) >= 6:
-                    notes.append(line)
+    collected = []
 
-        notes = list(dict.fromkeys(notes))[:8]
-        joined = " | ".join(notes)
+    for url in urls:
+        try:
+            html = fetch_text(url, timeout=15)
+            soup = BeautifulSoup(html, "html.parser")
+            text = soup.get_text("\n", strip=True)
+            lines = parse_n5_lines(text)
+            collected.extend(lines)
+            if collected:
+                break
+        except Exception:
+            continue
 
+    collected = list(dict.fromkeys(collected))[:5]
+
+    if collected:
+        joined = " | ".join(collected)
         status = normalize_traffic_status(joined)
+        pretty = []
+        for x in collected[:3]:
+            if len(x) > 42:
+                x = x[:42] + "…"
+            pretty.append(x)
 
-        # 優先做成你看得懂的兩段
         return {
             "title": "國五即時路況",
             "status": status,
-            "lines": [
-                f"國5 / 雪隧：{status}",
-                notes[0] if notes else "1968 即時資料已更新",
-                notes[1] if len(notes) > 1 else "建議出發前再看一次 1968",
-            ],
+            "lines": pretty if pretty else [f"國5 / 雪隧：{status}"],
             "source": "高速公路1968",
         }
-    except Exception as e:
-        return {
-            "title": "國五即時路況",
-            "status": "資料取得中",
-            "lines": [
-                "國5 / 雪隧：資料取得中",
-                f"fallback: {type(e).__name__}",
-                "請改查高速公路1968",
-            ],
-            "source": "高速公路1968",
-        }
+
+    return {
+        "title": "國五即時路況",
+        "status": "資料取得中",
+        "lines": [
+            "國5 / 雪隧：資料取得中",
+            "1968 查詢暫時失敗",
+            "稍後自動恢復",
+        ],
+        "source": "高速公路1968",
+    }
 
 
 # =========================
@@ -354,6 +361,8 @@ def build_ai_summary(stocks):
     strong = [s for s in stocks if s["signal"] == "強勢股"]
     turning = [s for s in stocks if s["signal"] == "轉折點"]
     hot = [s for s in stocks if s["signal"] == "高檔震盪"]
+
+    valid_scores = [s for s in stocks if isinstance(s["win_rate"], int)]
 
     if strong:
         group = "AI / 高算力族群偏強"
@@ -368,7 +377,8 @@ def build_ai_summary(stocks):
         group = "盤勢中性整理"
         action = "控倉等待突破"
 
-    top = sorted(stocks, key=lambda x: x["win_rate"], reverse=True)[0]
+    top = max(valid_scores, key=lambda x: x["win_rate"]) if valid_scores else {"name": "無資料", "win_rate": 50}
+
     return {
         "group": group,
         "action": action,
@@ -378,7 +388,7 @@ def build_ai_summary(stocks):
 
 
 # =========================
-# HTML 產生
+# HTML
 # =========================
 def esc_html(text: str) -> str:
     return (
@@ -407,14 +417,14 @@ body {{ font-family: Arial, "Noto Sans TC", sans-serif; padding: 24px; color: #2
 .card {{ border: 1px solid #ddd; border-radius: 16px; padding: 16px; margin-bottom: 16px; }}
 .section-title {{ font-size: 18px; font-weight: 700; margin-bottom: 10px; }}
 .weather-row, .stock-row, .news-row, .traffic-row {{ margin: 8px 0; }}
-.badge {{ display: inline-block; padding: 2px 8px; border-radius: 10px; background: #f3f3f3; margin-left: 6px; }}
-.small {{ color: #666; font-size: 13px; }}
+.small {{ color: #666; font-size: 13px; display:block; margin-top:4px; }}
 </style>
 </head>
 <body>
+
 <div class="card">
   <div class="section-title">🔥 早安｜AI智慧早報</div>
-  <div>{TODAY}</div>
+  <div>{TODAY} 早報</div>
 </div>
 
 <div class="card weather">
@@ -436,7 +446,6 @@ body {{ font-family: Arial, "Noto Sans TC", sans-serif; padding: 24px; color: #2
   {''.join(
       f'''
       <div class="task-item stock-row">
-        <span class="task-priority {'p-high' if s["signal"] == "強勢股" else 'p-mid'}"></span>
         <span class="task-name">{esc_html(s["emoji"])} {esc_html(s["name"])} {s["change_pct"]:+.2f}%｜{esc_html(s["signal"])}｜勝率{s["win_rate"]}%</span>
         <span class="task-meta small">{esc_html(s["reason"])} / RSI {esc_html(s["rsi14"])}</span>
       </div>
@@ -448,8 +457,7 @@ body {{ font-family: Arial, "Noto Sans TC", sans-serif; padding: 24px; color: #2
 <div class="card mails">
   <div class="section-title">🚗 國五即時路況</div>
   <div class="mail-item">
-    <span class="urgency-dot {'p-high' if traffic["status"] != "順暢" else 'p-mid'}"></span>
-    <span class="mail-sender">{esc_html(traffic["title"])}</span>
+    <span class="mail-sender">{esc_html(traffic["title"])}</span>｜
     <span class="mail-subject">{esc_html(traffic["status"])}</span>
   </div>
   {''.join(f'<div class="traffic-row small">{esc_html(line)}</div>' for line in traffic["lines"])}
@@ -457,19 +465,21 @@ body {{ font-family: Arial, "Noto Sans TC", sans-serif; padding: 24px; color: #2
 
 <div class="card news">
   <div class="section-title">📰 新聞速報</div>
-  {''.join(
-      f'''
-      <div class="news-group">
-        <div class="small"><strong>{esc_html(cat)}</strong></div>
-        {''.join(f'<div class="news-item news-row" data-cat="{key}"><span class="news-headline">{esc_html(item["title"])}</span></div>' for item in items)}
-      </div>
-      '''
-      for key, cat, items in [
-          ("ai", "🤖 AI", news.get("ai", [])),
-          ("youtube", "📺 YouTube", news.get("youtube", [])),
-          ("etf", "📈 ETF", news.get("etf", [])),
-      ]
-  )}
+
+  <div class="news-group">
+    <div><strong>🤖 AI</strong></div>
+    {''.join(f'<div class="news-item news-row" data-cat="ai"><span class="news-headline">{esc_html(item["title"])}</span></div>' for item in news.get("ai", []))}
+  </div>
+
+  <div class="news-group">
+    <div><strong>📺 YouTube</strong></div>
+    {''.join(f'<div class="news-item news-row" data-cat="youtube"><span class="news-headline">{esc_html(item["title"])}</span></div>' for item in news.get("youtube", []))}
+  </div>
+
+  <div class="news-group">
+    <div><strong>📈 ETF</strong></div>
+    {''.join(f'<div class="news-item news-row" data-cat="etf"><span class="news-headline">{esc_html(item["title"])}</span></div>' for item in news.get("etf", []))}
+  </div>
 </div>
 
 <div class="card ai-summary">
