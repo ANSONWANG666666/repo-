@@ -12,7 +12,7 @@ from bs4 import BeautifulSoup
 TODAY = datetime.now().strftime("%Y-%m-%d")
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (MorningBriefingBot/21.1; +https://github.com/)",
+    "User-Agent": "Mozilla/5.0 (MorningBriefingBot/21.2; +https://github.com/)",
     "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
 }
 
@@ -47,23 +47,12 @@ def fetch_text(url: str, timeout: int = 20):
     return r.text
 
 
-def safe_float(v, default=0.0):
-    try:
-        if v is None:
-            return default
-        if isinstance(v, str):
-            v = v.replace(",", "").replace("%", "").strip()
-        return float(v)
-    except Exception:
-        return default
-
-
 def clamp(n, low, high):
     return max(low, min(high, n))
 
 
 # =========================
-# 🌤 天氣（穩定版）
+# 🌤 天氣
 # =========================
 def get_weather(lat: float, lon: float) -> dict:
     url = (
@@ -80,8 +69,6 @@ def get_weather(lat: float, lon: float) -> dict:
     return {
         "temp": f"{temp:.1f}°C" if isinstance(temp, (int, float)) else "--°C",
         "rain": f"{int(round(rain))}%" if isinstance(rain, (int, float)) else "--%",
-        "raw_temp": temp if isinstance(temp, (int, float)) else None,
-        "raw_rain": rain if isinstance(rain, (int, float)) else None,
         "source": "Open-Meteo",
     }
 
@@ -172,7 +159,6 @@ def calc_macd(close):
 
 def analyze_stock(name: str, ticker: str):
     try:
-        # 改用 Ticker().history()，避免 download() 常見 MultiIndex / TypeError 問題
         hist = yf.Ticker(ticker).history(period="3mo", interval="1d", auto_adjust=False)
 
         if hist is None or hist.empty or len(hist) < 35:
@@ -199,7 +185,8 @@ def analyze_stock(name: str, ticker: str):
         hist_prev = float(histv.iloc[-2])
 
         vol5 = float(vol.rolling(5).mean().iloc[-1])
-        vol20 = float(vol.rolling(20).mean().iloc[-1]) if float(vol.rolling(20).mean().iloc[-1]) != 0 else 1.0
+        vol20_raw = vol.rolling(20).mean().iloc[-1]
+        vol20 = float(vol20_raw) if not math.isnan(float(vol20_raw)) and float(vol20_raw) != 0 else 1.0
         vol_ratio = vol5 / vol20
 
         price_above_ma20 = last > ma20
@@ -280,66 +267,95 @@ def get_stocks():
 
 
 # =========================
-# 🚗 國五路況（多端點 fallback）
+# 🚗 國五路況（強化穩定版）
 # =========================
 def normalize_traffic_status(text: str) -> str:
     t = text.replace("　", " ").strip()
     if any(x in t for x in ["壅塞", "回堵", "事故", "車禍", "封閉"]):
         return "壅塞"
-    if any(x in t for x in ["車多", "行車量大", "旅行時間增加", "施工"]):
+    if any(x in t for x in ["車多", "行車量大", "旅行時間增加", "施工", "塞車"]):
         return "車多"
     return "順暢"
 
 
 def parse_n5_lines(text: str):
-    lines = []
+    results = []
     for raw in text.splitlines():
         line = re.sub(r"\s+", " ", raw).strip()
         if not line:
             continue
-        if any(k in line for k in ["國道5", "國5", "雪隧", "頭城", "坪林", "石碇", "南港系統"]):
-            if len(line) >= 6:
-                lines.append(line)
-    return list(dict.fromkeys(lines))
+
+        if any(k in line for k in [
+            "國道5", "國5", "雪隧", "頭城", "坪林", "石碇", "南港系統", "蘇澳", "宜蘭", "羅東"
+        ]):
+            if len(line) >= 5:
+                results.append(line)
+
+    return list(dict.fromkeys(results))
+
+
+def shorten_line(s: str, max_len: int = 42) -> str:
+    s = re.sub(r"\s+", " ", s).strip()
+    return s if len(s) <= max_len else s[:max_len] + "…"
+
+
+def _safe_title_text(soup):
+    parts = []
+    if soup.title and soup.title.text:
+        parts.append(soup.title.text.strip())
+
+    for meta in soup.find_all("meta"):
+        content = meta.get("content")
+        if content and any(k in content for k in ["國道5", "國5", "雪隧", "頭城", "坪林", "蘇澳", "宜蘭"]):
+            parts.append(content.strip())
+
+    return "\n".join(parts)
 
 
 def get_traffic():
-    urls = [
-        "https://1968.freeway.gov.tw/roadinfo?freeway=5",
-        "https://1968.freeway.gov.tw/n_notify",
-        "https://1968.freeway.gov.tw/",
+    sources = [
+        ("官方1968", "https://1968.freeway.gov.tw/"),
+        ("官方1968-英文頁", "https://1968.freeway.gov.tw/?lang=en"),
+        ("備援-國5影像頁", "https://www.1968services.tw/freeway/5"),
+        ("備援-國5塞車頁", "https://www.1968services.tw/jam/n5"),
+        ("備援-即時路況地圖", "https://www.1968services.tw/map"),
     ]
 
     collected = []
+    hit_source = ""
 
-    for url in urls:
+    for source_name, url in sources:
         try:
             html = fetch_text(url, timeout=15)
             soup = BeautifulSoup(html, "html.parser")
             text = soup.get_text("\n", strip=True)
             lines = parse_n5_lines(text)
-            collected.extend(lines)
-            if collected:
+
+            title_text = _safe_title_text(soup)
+            if title_text:
+                lines.extend(parse_n5_lines(title_text))
+
+            lines = list(dict.fromkeys(lines))
+            if lines:
+                collected = lines[:6]
+                hit_source = source_name
                 break
         except Exception:
             continue
 
-    collected = list(dict.fromkeys(collected))[:5]
-
     if collected:
         joined = " | ".join(collected)
         status = normalize_traffic_status(joined)
-        pretty = []
-        for x in collected[:3]:
-            if len(x) > 42:
-                x = x[:42] + "…"
-            pretty.append(x)
+
+        pretty_lines = [shorten_line(line) for line in collected[:3]]
+        if not pretty_lines:
+            pretty_lines = [f"國5 / 雪隧：{status}"]
 
         return {
             "title": "國五即時路況",
             "status": status,
-            "lines": pretty if pretty else [f"國5 / 雪隧：{status}"],
-            "source": "高速公路1968",
+            "lines": pretty_lines,
+            "source": hit_source or "高速公路資料",
         }
 
     return {
@@ -347,10 +363,10 @@ def get_traffic():
         "status": "資料取得中",
         "lines": [
             "國5 / 雪隧：資料取得中",
-            "1968 查詢暫時失敗",
-            "稍後自動恢復",
+            "官方與備援站暫時無法連線",
+            "下次排程會自動重試",
         ],
-        "source": "高速公路1968",
+        "source": "fallback",
     }
 
 
@@ -361,7 +377,6 @@ def build_ai_summary(stocks):
     strong = [s for s in stocks if s["signal"] == "強勢股"]
     turning = [s for s in stocks if s["signal"] == "轉折點"]
     hot = [s for s in stocks if s["signal"] == "高檔震盪"]
-
     valid_scores = [s for s in stocks if isinstance(s["win_rate"], int)]
 
     if strong:
@@ -461,6 +476,7 @@ body {{ font-family: Arial, "Noto Sans TC", sans-serif; padding: 24px; color: #2
     <span class="mail-subject">{esc_html(traffic["status"])}</span>
   </div>
   {''.join(f'<div class="traffic-row small">{esc_html(line)}</div>' for line in traffic["lines"])}
+  <div class="traffic-row small">來源：{esc_html(traffic.get("source", ""))}</div>
 </div>
 
 <div class="card news">
