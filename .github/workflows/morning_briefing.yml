@@ -2,7 +2,7 @@ name: 每日早報推播 Telegram
 
 on:
   schedule:
-    - cron: '30 23 * * *'   # 台灣早上 07:30
+    - cron: '30 23 * * *'
   workflow_dispatch:
 
 jobs:
@@ -23,6 +23,9 @@ jobs:
 
       - name: Generate HTML
         run: python generate_briefing.py
+
+      - name: Debug List Files
+        run: ls -l   # ⭐確認 HTML 有沒有生成
 
       - name: Send Telegram
         run: python send_morning_briefing_telegram.py
