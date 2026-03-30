@@ -1,8 +1,5 @@
 """
-Telegram 發送器 v21
-- 讀取 morning-briefing-YYYY-MM-DD.html
-- 解析雙城市天氣 / 三則新聞 / AI股票洞察 / 國五路況 / AI總結
-- 輸出 Telegram MarkdownV2 卡片式訊息
+Telegram 發送器 v21.1
 """
 
 import os
@@ -11,7 +8,6 @@ from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
-
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHAT_ID = os.environ.get("CHAT_ID", "")
@@ -60,7 +56,6 @@ def parse_briefing(html_path: Path) -> dict:
         "ai_summary": [],
     }
 
-    # 天氣：多筆
     for w in soup.select(".weather .weather-info"):
         result["weather_list"].append({
             "city": _text(w.select_one(".city")),
@@ -68,7 +63,6 @@ def parse_briefing(html_path: Path) -> dict:
             "desc": _text(w.select_one(".desc")),
         })
 
-    # 股票
     for item in soup.select(".tasks .task-item"):
         task_name = _text(item.select_one(".task-name"))
         task_meta = _text(item.select_one(".task-meta"))
@@ -78,7 +72,6 @@ def parse_briefing(html_path: Path) -> dict:
                 "meta": task_meta,
             })
 
-    # 交通
     mail = soup.select_one(".mails .mail-item")
     if mail:
         result["traffic"]["title"] = _text(mail.select_one(".mail-sender"))
@@ -89,7 +82,6 @@ def parse_briefing(html_path: Path) -> dict:
         if txt:
             result["traffic"]["lines"].append(txt)
 
-    # 新聞：每類3則
     for item in soup.select(".news .news-item"):
         cat = item.get("data-cat", "").strip()
         headline = _text(item.select_one(".news-headline"))
@@ -99,7 +91,6 @@ def parse_briefing(html_path: Path) -> dict:
     for k in result["news"]:
         result["news"][k] = result["news"][k][:3]
 
-    # AI summary
     for row in soup.select(".ai-summary .summary-line"):
         txt = _text(row)
         if txt:
@@ -115,27 +106,20 @@ def build_message(data: dict) -> str:
         "",
     ]
 
-    # 天氣
     if data.get("weather_list"):
-        lines += [
-            "╭─ 🌤 *天氣觀測*",
-        ]
+        lines += ["╭─ 🌤 *天氣觀測*"]
         for w in data["weather_list"]:
             lines.append(f"│ 📍 *{esc(w['city'])}*｜{esc(w['temp'])}｜{esc(w['desc'])}")
         lines += ["╰────────────────", ""]
 
-    # 股票
     if data.get("stocks"):
-        lines += [
-            "╭─ 📈 *AI股票洞察*",
-        ]
+        lines += ["╭─ 📈 *AI股票洞察*"]
         for s in data["stocks"]:
             lines.append(f"│ {esc(s['line'])}")
             if s.get("meta"):
                 lines.append(f"│ └─ {esc(s['meta'])}")
         lines += ["╰────────────────", ""]
 
-    # 交通
     traffic = data.get("traffic", {})
     if traffic.get("title") or traffic.get("status"):
         lines += [
@@ -146,7 +130,6 @@ def build_message(data: dict) -> str:
             lines.append(f"│ {esc(t)}")
         lines += ["╰────────────────", ""]
 
-    # 新聞
     news = data.get("news", {})
     if any(news.values()):
         lines += ["╭─ 📰 *新聞速報*"]
@@ -156,6 +139,7 @@ def build_message(data: dict) -> str:
             "youtube": "📺 YouTube",
             "etf": "📈 ETF",
         }
+
         for key in ("ai", "youtube", "etf"):
             items = news.get(key, [])
             if not items:
@@ -166,7 +150,6 @@ def build_message(data: dict) -> str:
 
         lines += ["╰────────────────", ""]
 
-    # AI summary
     if data.get("ai_summary"):
         lines += ["╭─ 💡 *AI 今日判斷*"]
         for row in data["ai_summary"][:4]:
