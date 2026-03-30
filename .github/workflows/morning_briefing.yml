@@ -1,1 +1,31 @@
+name: 每日早報推播 Telegram
 
+on:
+  schedule:
+    - cron: '30 23 * * *'   # 台灣早上 07:30
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install
+        run: pip install -r requirements.txt
+
+      - name: Generate HTML
+        run: python generate_briefing.py
+
+      - name: Send Telegram
+        run: python send_morning_briefing_telegram.py
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
