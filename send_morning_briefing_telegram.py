@@ -1,35 +1,35 @@
 """
-send_morning_briefing_telegram.py
-GitHub Actions 版 — Token 從環境變數讀取
+Telegram 發送器 v21
+- 讀取 morning-briefing-YYYY-MM-DD.html
+- 解析雙城市天氣 / 三則新聞 / AI股票洞察 / 國五路況 / AI總結
+- 輸出 Telegram MarkdownV2 卡片式訊息
 """
 
 import os
-import requests
 from datetime import date
 from pathlib import Path
+
+import requests
 from bs4 import BeautifulSoup
 
-# ─── 設定（從 GitHub Secrets 注入）────────────────────────────
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-CHAT_ID   = os.environ.get("CHAT_ID", "")
 
-# ─── 找 HTML（已升級：三層 fallback）──────────────────────────
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+CHAT_ID = os.environ.get("CHAT_ID", "")
+
+
 def find_briefing_html() -> Path:
     today = date.today().strftime("%Y-%m-%d")
 
-    # 1️⃣ 找今天檔
     today_path = Path(f"morning-briefing-{today}.html")
     if today_path.exists():
         print(f"✅ 使用今日早報：{today_path}")
         return today_path
 
-    # 2️⃣ 找固定檔（你目前 repo 有的）
     default_path = Path("morning-briefing.html")
     if default_path.exists():
         print("⚠️ 使用固定檔：morning-briefing.html")
         return default_path
 
-    # 3️⃣ 找歷史最新檔
     files = sorted(Path(".").glob("morning-briefing-*.html"), reverse=True)
     if files:
         print(f"⚠️ 使用最新檔：{files[0]}")
@@ -37,134 +37,168 @@ def find_briefing_html() -> Path:
 
     raise FileNotFoundError("❌ 找不到任何早報 HTML")
 
-# ─── 工具函數 ────────────────────────────────────────────────
+
 def _text(el) -> str:
-    return el.text.strip() if el else ""
+    return el.get_text(" ", strip=True) if el else ""
 
-# ─── 解析 HTML ──────────────────────────────────────────────
-def parse_briefing(html_path: Path) -> dict:
-    soup = BeautifulSoup(html_path.read_text(encoding="utf-8"), "html.parser")
-    result = {}
 
-    result["date"] = _text(soup.find("title")) or date.today().strftime("%Y/%m/%d")
-
-    result["weather"] = {
-        "icon": _text(soup.select_one(".weather-icon")) or "🌤",
-        "city": _text(soup.select_one(".weather-info .city")) or "",
-        "temp": _text(soup.select_one(".weather-info .temp")) or "",
-        "desc": _text(soup.select_one(".weather-info .desc")) or "",
-    }
-
-    # 任務
-    tasks = []
-    for level in ("p-high", "p-mid"):
-        for item in soup.select(".task-item"):
-            p_el = item.select_one(".task-priority")
-            name = item.select_one(".task-name")
-            if p_el and level in p_el.get("class", []):
-                tasks.append((level, _text(name) or "未知任務"))
-        if tasks:
-            break
-    result["tasks"] = tasks[:5]
-
-    # 郵件
-    mails = []
-    for item in soup.select(".mail-item"):
-        dot = item.select_one(".urgency-dot")
-        if dot and ("p-urgent" in dot.get("class", []) or "p-high" in dot.get("class", [])):
-            mails.append({
-                "sender": _text(item.select_one(".mail-sender")) or "未知",
-                "subject": _text(item.select_one(".mail-subject")) or "（無主旨）"
-            })
-    result["mails"] = mails[:3]
-
-    # 新聞
-    news = {}
-    for item in soup.select(".news-item"):
-        cat = item.get("data-cat", "")
-        headline = item.select_one(".news-headline")
-        if headline and cat not in news:
-            news[cat] = _text(headline)
-    result["news"] = news
-
-    return result
-
-# ─── Telegram MarkdownV2 escape ────────────────────────────
 def esc(text: str) -> str:
+    text = str(text)
     for ch in r"\_*[]()~`>#+-=|{}.!":
         text = text.replace(ch, f"\\{ch}")
     return text
 
-# ─── 建立訊息 ──────────────────────────────────────────────
+
+def parse_briefing(html_path: Path) -> dict:
+    soup = BeautifulSoup(html_path.read_text(encoding="utf-8"), "html.parser")
+    result = {
+        "date": _text(soup.find("title")) or date.today().strftime("%Y-%m-%d"),
+        "weather_list": [],
+        "stocks": [],
+        "traffic": {"title": "", "status": "", "lines": []},
+        "news": {"ai": [], "youtube": [], "etf": []},
+        "ai_summary": [],
+    }
+
+    # 天氣：多筆
+    for w in soup.select(".weather .weather-info"):
+        result["weather_list"].append({
+            "city": _text(w.select_one(".city")),
+            "temp": _text(w.select_one(".temp")),
+            "desc": _text(w.select_one(".desc")),
+        })
+
+    # 股票
+    for item in soup.select(".tasks .task-item"):
+        task_name = _text(item.select_one(".task-name"))
+        task_meta = _text(item.select_one(".task-meta"))
+        if task_name:
+            result["stocks"].append({
+                "line": task_name,
+                "meta": task_meta,
+            })
+
+    # 交通
+    mail = soup.select_one(".mails .mail-item")
+    if mail:
+        result["traffic"]["title"] = _text(mail.select_one(".mail-sender"))
+        result["traffic"]["status"] = _text(mail.select_one(".mail-subject"))
+
+    for row in soup.select(".mails .traffic-row"):
+        txt = _text(row)
+        if txt:
+            result["traffic"]["lines"].append(txt)
+
+    # 新聞：每類3則
+    for item in soup.select(".news .news-item"):
+        cat = item.get("data-cat", "").strip()
+        headline = _text(item.select_one(".news-headline"))
+        if cat in result["news"] and headline:
+            result["news"][cat].append(headline)
+
+    for k in result["news"]:
+        result["news"][k] = result["news"][k][:3]
+
+    # AI summary
+    for row in soup.select(".ai-summary .summary-line"):
+        txt = _text(row)
+        if txt:
+            result["ai_summary"].append(txt)
+
+    return result
+
+
 def build_message(data: dict) -> str:
-    w = data.get("weather", {})
     lines = [
-        "*☀️ 早安\\！早報摘要*",
-        f"📅 {esc(data.get('date',''))}",
-        ""
+        "🔥 *早安｜AI智慧早報*",
+        f"📅 *{esc(data.get('date', ''))}*",
+        "",
     ]
 
-    if w.get("temp"):
+    # 天氣
+    if data.get("weather_list"):
         lines += [
-            f"{esc(w['icon'])} {esc(w['city'])} {esc(w['temp'])} {esc(w['desc'])}",
-            ""
+            "╭─ 🌤 *天氣觀測*",
         ]
+        for w in data["weather_list"]:
+            lines.append(f"│ 📍 *{esc(w['city'])}*｜{esc(w['temp'])}｜{esc(w['desc'])}")
+        lines += ["╰────────────────", ""]
 
-    # 任務
-    if data.get("tasks"):
-        lines.append("*─── 今日任務 ───*")
-        for level, name in data["tasks"]:
-            icon = "🔴" if "high" in level else "🟡"
-            lines.append(f"{icon} {esc(name)}")
-        lines.append("")
+    # 股票
+    if data.get("stocks"):
+        lines += [
+            "╭─ 📈 *AI股票洞察*",
+        ]
+        for s in data["stocks"]:
+            lines.append(f"│ {esc(s['line'])}")
+            if s.get("meta"):
+                lines.append(f"│ └─ {esc(s['meta'])}")
+        lines += ["╰────────────────", ""]
 
-    # 郵件
-    if data.get("mails"):
-        lines.append("*─── 重要郵件 ───*")
-        for m in data["mails"]:
-            lines.append(f"📧 {esc(m['sender'])}｜{esc(m['subject'])}")
-        lines.append("")
+    # 交通
+    traffic = data.get("traffic", {})
+    if traffic.get("title") or traffic.get("status"):
+        lines += [
+            "╭─ 🚗 *國五即時路況*",
+            f"│ {esc(traffic.get('title', '國五即時路況'))}｜{esc(traffic.get('status', ''))}",
+        ]
+        for t in traffic.get("lines", [])[:3]:
+            lines.append(f"│ {esc(t)}")
+        lines += ["╰────────────────", ""]
 
     # 新聞
-    if data.get("news"):
-        lines.append("*─── 新聞速報 ───*")
-        for cat, headline in data["news"].items():
-            prefix = {
-                "ai": "🤖 AI",
-                "etf": "📈 ETF",
-                "youtube": "📺 YT"
-            }.get(cat, cat.upper())
-            lines.append(f"*{esc(prefix)}* {esc(headline)}")
-        lines.append("")
+    news = data.get("news", {})
+    if any(news.values()):
+        lines += ["╭─ 📰 *新聞速報*"]
+
+        section_names = {
+            "ai": "🤖 AI",
+            "youtube": "📺 YouTube",
+            "etf": "📈 ETF",
+        }
+        for key in ("ai", "youtube", "etf"):
+            items = news.get(key, [])
+            if not items:
+                continue
+            lines.append(f"│ *{esc(section_names[key])}*")
+            for i, title in enumerate(items[:3], 1):
+                lines.append(f"│ {i}\\. {esc(title)}")
+
+        lines += ["╰────────────────", ""]
+
+    # AI summary
+    if data.get("ai_summary"):
+        lines += ["╭─ 💡 *AI 今日判斷*"]
+        for row in data["ai_summary"][:4]:
+            lines.append(f"│ {esc(row)}")
+        lines += ["╰────────────────", ""]
 
     lines += [
-        esc("─────────────────"),
-        "Have a great day\\! 🚀"
+        "━━━━━━━━━━━━━━━━━━",
+        "🚀 *Have a great day\\!*"
     ]
-
     return "\n".join(lines)
 
-# ─── 發送 Telegram ────────────────────────────────────────
+
 def send_telegram(message: str):
     if not BOT_TOKEN or not CHAT_ID:
         raise ValueError("❌ BOT_TOKEN 或 CHAT_ID 未設定")
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-
     resp = requests.post(
         url,
         json={
             "chat_id": CHAT_ID,
             "text": message,
-            "parse_mode": "MarkdownV2"
+            "parse_mode": "MarkdownV2",
+            "disable_web_page_preview": True,
         },
-        timeout=10
+        timeout=20
     )
-
     resp.raise_for_status()
     print("✅ Telegram 發送成功")
 
-# ─── 主程式 ───────────────────────────────────────────────
+
 def main():
     html_path = find_briefing_html()
     print(f"📄 使用檔案：{html_path}")
@@ -172,8 +206,10 @@ def main():
     data = parse_briefing(html_path)
     message = build_message(data)
 
-    print("📨 預覽訊息：\n", message)
+    print("📨 預覽訊息：\n")
+    print(message)
     send_telegram(message)
+
 
 if __name__ == "__main__":
     main()
