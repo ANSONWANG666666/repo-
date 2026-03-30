@@ -1,4 +1,3 @@
-import math
 import re
 from datetime import datetime
 from pathlib import Path
@@ -6,20 +5,19 @@ from urllib.parse import quote
 
 import feedparser
 import requests
-import yfinance as yf
 from bs4 import BeautifulSoup
 
 TODAY = datetime.now().strftime("%Y-%m-%d")
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (MorningBriefingBot/21.2; +https://github.com/)",
+    "User-Agent": "Mozilla/5.0 (MorningBriefingBot/21.3; +https://github.com/)",
     "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
 }
 
 STOCKS = [
-    {"name": "台積電", "ticker": "2330.TW"},
-    {"name": "聯發科", "ticker": "2454.TW"},
-    {"name": "廣達", "ticker": "2382.TW"},
+    {"name": "台積電", "code": "2330"},
+    {"name": "聯發科", "code": "2454"},
+    {"name": "廣達", "code": "2382"},
 ]
 
 NEWS_TOPICS = [
@@ -51,6 +49,25 @@ def clamp(n, low, high):
     return max(low, min(high, n))
 
 
+def first_non_empty(d: dict, keys, default=""):
+    for k in keys:
+        if k in d:
+            v = str(d.get(k, "")).strip()
+            if v and v != "None" and v != "--":
+                return v
+    return default
+
+
+def to_float(v, default=0.0):
+    try:
+        s = str(v).replace(",", "").replace("%", "").strip()
+        if s in {"", "--", "X", "除權息"}:
+            return default
+        return float(s)
+    except Exception:
+        return default
+
+
 # =========================
 # 🌤 天氣
 # =========================
@@ -58,7 +75,7 @@ def get_weather(lat: float, lon: float) -> dict:
     url = (
         "https://api.open-meteo.com/v1/forecast"
         f"?latitude={lat}&longitude={lon}"
-        "&current=temperature_2m,precipitation_probability,weather_code"
+        "&current=temperature_2m,precipitation_probability"
         "&timezone=Asia%2FTaipei"
     )
     data = fetch_json(url, timeout=20)
@@ -97,12 +114,20 @@ def get_weather_list():
 
 
 # =========================
-# 📰 新聞
+# 📰 新聞：更乾淨去重
 # =========================
-def clean_news_title(title: str) -> str:
+def normalize_news_title(title: str) -> str:
     title = re.sub(r"\s*-\s*[^-]+$", "", title).strip()
     title = re.sub(r"\s+", " ", title)
+    title = title.replace("｜", "|")
+    title = title.replace("（", "(").replace("）", ")")
     return title
+
+
+def news_fingerprint(title: str) -> str:
+    t = normalize_news_title(title).lower()
+    t = re.sub(r"[^\w\u4e00-\u9fff]+", "", t)
+    return t
 
 
 def get_news(keyword: str, limit: int = 3):
@@ -111,18 +136,25 @@ def get_news(keyword: str, limit: int = 3):
     feed = feedparser.parse(url)
 
     items = []
-    seen = set()
+    seen_fp = set()
+
     for entry in feed.entries:
-        title = clean_news_title(getattr(entry, "title", "").strip())
-        if not title or title in seen:
+        title = normalize_news_title(getattr(entry, "title", "").strip())
+        if not title:
             continue
-        seen.add(title)
+
+        fp = news_fingerprint(title)
+        if fp in seen_fp:
+            continue
+
+        seen_fp.add(fp)
         items.append({
             "title": title,
             "link": getattr(entry, "link", ""),
         })
         if len(items) >= limit:
             break
+
     return items
 
 
@@ -137,137 +169,166 @@ def get_all_news():
 
 
 # =========================
-# 📈 股票 AI 分析
+# 📈 股票：改接 TWSE 官方 OpenAPI
 # =========================
-def rsi(series, period=14):
-    delta = series.diff()
-    gain = delta.clip(lower=0).rolling(period).mean()
-    loss = (-delta.clip(upper=0)).rolling(period).mean()
-    rs = gain / loss.replace(0, math.nan)
-    out = 100 - (100 / (1 + rs))
-    return out.fillna(50)
+def fetch_twse_stock_day_all():
+    return fetch_json("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", timeout=25)
 
 
-def calc_macd(close):
-    ema12 = close.ewm(span=12, adjust=False).mean()
-    ema26 = close.ewm(span=26, adjust=False).mean()
-    macd = ema12 - ema26
-    signal = macd.ewm(span=9, adjust=False).mean()
-    hist = macd - signal
-    return macd, signal, hist
+def fetch_twse_bwibbu_all():
+    return fetch_json("https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL", timeout=25)
 
 
-def analyze_stock(name: str, ticker: str):
+def build_index_by_code(rows):
+    out = {}
+    for row in rows:
+        code = first_non_empty(row, ["Code", "股票代號", "證券代號"])
+        if code:
+            out[code] = row
+    return out
+
+
+def analyze_stock_with_twse(code: str, name: str, price_row: dict, val_row: dict):
+    close_price = to_float(first_non_empty(price_row, ["ClosingPrice", "收盤價"]))
+    open_price = to_float(first_non_empty(price_row, ["OpeningPrice", "開盤價"]))
+    high_price = to_float(first_non_empty(price_row, ["HighestPrice", "最高價"]))
+    low_price = to_float(first_non_empty(price_row, ["LowestPrice", "最低價"]))
+    change = to_float(first_non_empty(price_row, ["Change", "漲跌價差"]))
+    direction = first_non_empty(price_row, ["Dir", "漲跌(+/-)"], "")
+    volume = to_float(first_non_empty(price_row, ["TradeVolume", "成交股數"]), 0.0)
+
+    if direction == "-":
+        change = -abs(change)
+    elif direction == "+":
+        change = abs(change)
+
+    prev_close = close_price - change if close_price and change is not None else 0.0
+    change_pct = (change / prev_close * 100) if prev_close else 0.0
+
+    pe = to_float(first_non_empty(val_row, ["PEratio", "本益比"]), 0.0)
+    pb = to_float(first_non_empty(val_row, ["PBratio", "股價淨值比"]), 0.0)
+    yield_pct = to_float(first_non_empty(val_row, ["DividendYield", "殖利率(%)"]), 0.0)
+
+    intraday_range_pct = ((high_price - low_price) / open_price * 100) if open_price else 0.0
+    close_near_high = (close_price >= (high_price - (high_price - low_price) * 0.25)) if high_price and low_price else False
+
+    score = 50
+
+    if change_pct >= 3:
+        score += 16
+    elif change_pct >= 1.5:
+        score += 10
+    elif change_pct <= -2:
+        score -= 10
+
+    if close_near_high:
+        score += 8
+
+    if intraday_range_pct >= 4:
+        score += 6
+
+    if volume >= 30_000_000:
+        score += 8
+    elif volume >= 10_000_000:
+        score += 4
+
+    if pe > 0:
+        score += 3
+    if 0 < pb <= 8:
+        score += 3
+    if yield_pct >= 2:
+        score += 2
+
+    score = int(clamp(round(score), 35, 92))
+
+    if change_pct >= 2 and close_near_high:
+        signal_text = "強勢股"
+        reason = "收盤偏強 / 當日動能強"
+        emoji = "🔴"
+    elif change_pct > 0 and intraday_range_pct >= 3:
+        signal_text = "轉折點"
+        reason = "波動放大 / 轉強觀察"
+        emoji = "🟡"
+    elif change_pct <= -2:
+        signal_text = "整理觀察"
+        reason = "短線拉回 / 等待止穩"
+        emoji = "⚪"
+    else:
+        signal_text = "整理觀察"
+        reason = "量價中性 / 觀察續航"
+        emoji = "⚪"
+
+    return {
+        "code": code,
+        "name": name,
+        "price": close_price if close_price else "--",
+        "change_pct": round(change_pct, 2),
+        "signal": signal_text,
+        "reason": reason,
+        "win_rate": score,
+        "emoji": emoji,
+        "volume": int(volume) if volume else 0,
+        "pe": pe,
+        "pb": pb,
+        "yield": yield_pct,
+    }
+
+
+def get_stocks():
     try:
-        hist = yf.Ticker(ticker).history(period="3mo", interval="1d", auto_adjust=False)
+        price_rows = fetch_twse_stock_day_all()
+        val_rows = fetch_twse_bwibbu_all()
 
-        if hist is None or hist.empty or len(hist) < 35:
-            raise ValueError("not enough price history")
+        price_index = build_index_by_code(price_rows)
+        val_index = build_index_by_code(val_rows)
 
-        close = hist["Close"].astype(float).dropna()
-        vol = hist["Volume"].astype(float).fillna(0)
+        result = []
+        for s in STOCKS:
+            code = s["code"]
+            name = s["name"]
+            price_row = price_index.get(code, {})
+            val_row = val_index.get(code, {})
 
-        if len(close) < 35:
-            raise ValueError("not enough close series")
+            if not price_row:
+                result.append({
+                    "code": code,
+                    "name": name,
+                    "price": "--",
+                    "change_pct": 0.0,
+                    "signal": "資料取得中",
+                    "reason": "TWSE無當日資料",
+                    "win_rate": 50,
+                    "emoji": "⚪",
+                    "volume": 0,
+                    "pe": 0,
+                    "pb": 0,
+                    "yield": 0,
+                })
+                continue
 
-        last = float(close.iloc[-1])
-        prev = float(close.iloc[-2])
-        day_change = ((last - prev) / prev) * 100 if prev else 0.0
+            result.append(analyze_stock_with_twse(code, name, price_row, val_row))
 
-        ma5 = float(close.rolling(5).mean().iloc[-1])
-        ma10 = float(close.rolling(10).mean().iloc[-1])
-        ma20 = float(close.rolling(20).mean().iloc[-1])
-
-        rsi14 = float(rsi(close, 14).iloc[-1])
-
-        macd, signal, histv = calc_macd(close)
-        hist_now = float(histv.iloc[-1])
-        hist_prev = float(histv.iloc[-2])
-
-        vol5 = float(vol.rolling(5).mean().iloc[-1])
-        vol20_raw = vol.rolling(20).mean().iloc[-1]
-        vol20 = float(vol20_raw) if not math.isnan(float(vol20_raw)) and float(vol20_raw) != 0 else 1.0
-        vol_ratio = vol5 / vol20
-
-        price_above_ma20 = last > ma20
-        price_above_ma5 = last > ma5
-        trend_up = ma5 > ma10 > ma20
-        macd_turn_up = hist_now > hist_prev and hist_now > -0.05
-        volume_expand = vol_ratio >= 1.05
-
-        score = 50
-        if price_above_ma20:
-            score += 8
-        if price_above_ma5:
-            score += 5
-        if trend_up:
-            score += 12
-        if macd_turn_up:
-            score += 8
-        if 52 <= rsi14 <= 72:
-            score += 10
-        elif 72 < rsi14 <= 80:
-            score += 3
-        elif rsi14 < 40:
-            score -= 8
-        if volume_expand:
-            score += 6
-        if day_change > 2:
-            score += 5
-        elif day_change < -2:
-            score -= 8
-
-        score = int(clamp(round(score), 35, 92))
-
-        if trend_up and rsi14 >= 55 and day_change >= 1:
-            signal_text = "強勢股"
-            reason = "均線多頭 / 動能延續"
-            emoji = "🔴"
-        elif macd_turn_up and last >= ma20 * 0.98:
-            signal_text = "轉折點"
-            reason = "MACD翻揚 / 轉強觀察"
-            emoji = "🟡"
-        elif rsi14 > 75:
-            signal_text = "高檔震盪"
-            reason = "短線過熱 / 留意震盪"
-            emoji = "🟠"
-        else:
-            signal_text = "整理觀察"
-            reason = "型態整理 / 等待突破"
-            emoji = "⚪"
-
-        return {
-            "name": name,
-            "ticker": ticker,
-            "price": round(last, 2),
-            "change_pct": round(day_change, 2),
-            "signal": signal_text,
-            "reason": reason,
-            "win_rate": score,
-            "emoji": emoji,
-            "rsi14": round(rsi14, 1),
-        }
+        return result
 
     except Exception as e:
-        return {
-            "name": name,
-            "ticker": ticker,
+        return [{
+            "code": s["code"],
+            "name": s["name"],
             "price": "--",
             "change_pct": 0.0,
             "signal": "資料取得中",
             "reason": type(e).__name__,
             "win_rate": 50,
             "emoji": "⚪",
-            "rsi14": 0,
-        }
-
-
-def get_stocks():
-    return [analyze_stock(s["name"], s["ticker"]) for s in STOCKS]
+            "volume": 0,
+            "pe": 0,
+            "pb": 0,
+            "yield": 0,
+        } for s in STOCKS]
 
 
 # =========================
-# 🚗 國五路況（強化穩定版）
+# 🚗 國五：南下 / 北上分開顯示
 # =========================
 def normalize_traffic_status(text: str) -> str:
     t = text.replace("　", " ").strip()
@@ -284,17 +345,15 @@ def parse_n5_lines(text: str):
         line = re.sub(r"\s+", " ", raw).strip()
         if not line:
             continue
-
         if any(k in line for k in [
-            "國道5", "國5", "雪隧", "頭城", "坪林", "石碇", "南港系統", "蘇澳", "宜蘭", "羅東"
+            "國道5", "國5", "雪隧", "頭城", "坪林", "石碇", "南港系統", "蘇澳", "宜蘭", "羅東", "南下", "北上"
         ]):
             if len(line) >= 5:
                 results.append(line)
-
     return list(dict.fromkeys(results))
 
 
-def shorten_line(s: str, max_len: int = 42) -> str:
+def shorten_line(s: str, max_len: int = 46) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s if len(s) <= max_len else s[:max_len] + "…"
 
@@ -306,10 +365,37 @@ def _safe_title_text(soup):
 
     for meta in soup.find_all("meta"):
         content = meta.get("content")
-        if content and any(k in content for k in ["國道5", "國5", "雪隧", "頭城", "坪林", "蘇澳", "宜蘭"]):
+        if content and any(k in content for k in ["國道5", "國5", "雪隧", "頭城", "坪林", "蘇澳", "宜蘭", "南下", "北上"]):
             parts.append(content.strip())
 
     return "\n".join(parts)
+
+
+def split_direction_lines(lines):
+    south = []
+    north = []
+
+    for line in lines:
+        is_south = any(k in line for k in ["南下", "南港系統", "石碇", "坪林", "頭城", "宜蘭", "羅東", "蘇澳"])
+        is_north = any(k in line for k in ["北上", "蘇澳", "羅東", "宜蘭", "頭城", "坪林", "石碇", "南港系統"])
+
+        if "南下" in line and line not in south:
+            south.append(line)
+        elif "北上" in line and line not in north:
+            north.append(line)
+        else:
+            # 沒明寫方向時，先盡量依內容放兩邊都可理解的摘要
+            if is_south and line not in south:
+                south.append(line)
+            if is_north and line not in north:
+                north.append(line)
+
+    if not south and lines:
+        south = lines[:2]
+    if not north and lines:
+        north = lines[:2]
+
+    return south[:3], north[:3]
 
 
 def get_traffic():
@@ -337,34 +423,43 @@ def get_traffic():
 
             lines = list(dict.fromkeys(lines))
             if lines:
-                collected = lines[:6]
+                collected = lines[:10]
                 hit_source = source_name
                 break
         except Exception:
             continue
 
     if collected:
-        joined = " | ".join(collected)
-        status = normalize_traffic_status(joined)
+        south_lines_raw, north_lines_raw = split_direction_lines(collected)
+        south_joined = " | ".join(south_lines_raw)
+        north_joined = " | ".join(north_lines_raw)
 
-        pretty_lines = [shorten_line(line) for line in collected[:3]]
-        if not pretty_lines:
-            pretty_lines = [f"國5 / 雪隧：{status}"]
+        south_status = normalize_traffic_status(south_joined) if south_joined else "資料取得中"
+        north_status = normalize_traffic_status(north_joined) if north_joined else "資料取得中"
+
+        south_lines = [shorten_line(x) for x in south_lines_raw[:2]] or [f"南下：{south_status}"]
+        north_lines = [shorten_line(x) for x in north_lines_raw[:2]] or [f"北上：{north_status}"]
 
         return {
             "title": "國五即時路況",
-            "status": status,
-            "lines": pretty_lines,
+            "south_status": south_status,
+            "north_status": north_status,
+            "south_lines": south_lines,
+            "north_lines": north_lines,
             "source": hit_source or "高速公路資料",
         }
 
     return {
         "title": "國五即時路況",
-        "status": "資料取得中",
-        "lines": [
-            "國5 / 雪隧：資料取得中",
+        "south_status": "資料取得中",
+        "north_status": "資料取得中",
+        "south_lines": [
+            "南下：資料取得中",
             "官方與備援站暫時無法連線",
-            "下次排程會自動重試",
+        ],
+        "north_lines": [
+            "北上：資料取得中",
+            "官方與備援站暫時無法連線",
         ],
         "source": "fallback",
     }
@@ -376,18 +471,14 @@ def get_traffic():
 def build_ai_summary(stocks):
     strong = [s for s in stocks if s["signal"] == "強勢股"]
     turning = [s for s in stocks if s["signal"] == "轉折點"]
-    hot = [s for s in stocks if s["signal"] == "高檔震盪"]
     valid_scores = [s for s in stocks if isinstance(s["win_rate"], int)]
 
     if strong:
-        group = "AI / 高算力族群偏強"
-        action = "續抱強勢、弱留強"
+        group = "強勢股續航偏強"
+        action = "優先觀察動能股"
     elif turning:
-        group = "市場進入轉折觀察"
-        action = "等量價確認再加碼"
-    elif hot:
-        group = "短線偏熱"
-        action = "高檔不追價，等拉回"
+        group = "市場有轉強跡象"
+        action = "量價確認後再加碼"
     else:
         group = "盤勢中性整理"
         action = "控倉等待突破"
@@ -398,7 +489,7 @@ def build_ai_summary(stocks):
         "group": group,
         "action": action,
         "focus": f"最高分：{top['name']} {top['win_rate']}分",
-        "note": "勝率為技術面模型分數，非保證報酬。",
+        "note": "勝率為官方日資料快照模型分數，非保證報酬。",
     }
 
 
@@ -433,6 +524,7 @@ body {{ font-family: Arial, "Noto Sans TC", sans-serif; padding: 24px; color: #2
 .section-title {{ font-size: 18px; font-weight: 700; margin-bottom: 10px; }}
 .weather-row, .stock-row, .news-row, .traffic-row {{ margin: 8px 0; }}
 .small {{ color: #666; font-size: 13px; display:block; margin-top:4px; }}
+.traffic-block {{ margin-top: 10px; padding-top: 10px; border-top: 1px dashed #ddd; }}
 </style>
 </head>
 <body>
@@ -462,20 +554,26 @@ body {{ font-family: Arial, "Noto Sans TC", sans-serif; padding: 24px; color: #2
       f'''
       <div class="task-item stock-row">
         <span class="task-name">{esc_html(s["emoji"])} {esc_html(s["name"])} {s["change_pct"]:+.2f}%｜{esc_html(s["signal"])}｜勝率{s["win_rate"]}%</span>
-        <span class="task-meta small">{esc_html(s["reason"])} / RSI {esc_html(s["rsi14"])}</span>
+        <span class="task-meta small">{esc_html(s["reason"])} / PER {esc_html(s["pe"])} / PB {esc_html(s["pb"])} / 殖利率 {esc_html(s["yield"])}%</span>
       </div>
       '''
       for s in stocks
   )}
 </div>
 
-<div class="card mails">
+<div class="card traffic">
   <div class="section-title">🚗 國五即時路況</div>
-  <div class="mail-item">
-    <span class="mail-sender">{esc_html(traffic["title"])}</span>｜
-    <span class="mail-subject">{esc_html(traffic["status"])}</span>
+
+  <div class="traffic-block southbound">
+    <div class="traffic-title" data-dir="south">南下｜{esc_html(traffic["south_status"])}</div>
+    {''.join(f'<div class="traffic-row small south-line">{esc_html(line)}</div>' for line in traffic["south_lines"])}
   </div>
-  {''.join(f'<div class="traffic-row small">{esc_html(line)}</div>' for line in traffic["lines"])}
+
+  <div class="traffic-block northbound">
+    <div class="traffic-title" data-dir="north">北上｜{esc_html(traffic["north_status"])}</div>
+    {''.join(f'<div class="traffic-row small north-line">{esc_html(line)}</div>' for line in traffic["north_lines"])}
+  </div>
+
   <div class="traffic-row small">來源：{esc_html(traffic.get("source", ""))}</div>
 </div>
 
