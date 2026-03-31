@@ -1,5 +1,5 @@
 """
-Telegram 發送器 v21.3
+Telegram 發送器 v21.4
 """
 
 import os
@@ -58,6 +58,7 @@ def parse_briefing(html_path: Path) -> dict:
             "north_lines": [],
             "source": "",
         },
+        "personal_mails": [],
         "news": {"ai": [], "youtube": [], "etf": []},
         "ai_summary": [],
     }
@@ -103,6 +104,15 @@ def parse_briefing(html_path: Path) -> dict:
         txt = _text(row)
         if txt.startswith("來源："):
             result["traffic"]["source"] = txt.replace("來源：", "").strip()
+
+    for row in soup.select(".personal-mails .mail-item"):
+        sender = _text(row.select_one(".mail-sender"))
+        subject = _text(row.select_one(".mail-subject"))
+        if sender or subject:
+            result["personal_mails"].append({
+                "sender": sender,
+                "subject": subject,
+            })
 
     for item in soup.select(".news .news-item"):
         cat = item.get("data-cat", "").strip()
@@ -157,6 +167,13 @@ def build_message(data: dict) -> str:
 
         if traffic.get("source"):
             lines.append(f"│ 來源：{esc(traffic.get('source'))}")
+        lines += ["╰────────────────", ""]
+
+    if data.get("personal_mails"):
+        lines += ["╭─ 📧 *個人重要郵件*"]
+        for m in data["personal_mails"][:3]:
+            lines.append(f"│ {esc(m['sender'])}")
+            lines.append(f"│ └─ {esc(m['subject'])}")
         lines += ["╰────────────────", ""]
 
     news = data.get("news", {})
