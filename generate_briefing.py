@@ -1,7 +1,11 @@
+import email
+import imaplib
 import re
 from datetime import datetime
+from email.header import decode_header
 from pathlib import Path
 from urllib.parse import quote
+import html as html_lib
 
 import feedparser
 import requests
@@ -10,7 +14,7 @@ from bs4 import BeautifulSoup
 TODAY = datetime.now().strftime("%Y-%m-%d")
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (MorningBriefingBot/21.3; +https://github.com/)",
+    "User-Agent": "Mozilla/5.0 (MorningBriefingBot/21.4; +https://github.com/)",
     "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
 }
 
@@ -30,6 +34,9 @@ WEATHER_POINTS = [
     {"city": "桃園", "lat": 24.9936, "lon": 121.3009},
     {"city": "宜蘭五結", "lat": 24.6840, "lon": 121.7990},
 ]
+
+EMAIL_ACCOUNT = "wjia.tw@gmail.com"
+EMAIL_APP_PASSWORD = None  # 從環境變數讀，不要寫死
 
 
 def fetch_json(url: str, timeout: int = 20):
@@ -169,7 +176,7 @@ def get_all_news():
 
 
 # =========================
-# 📈 股票：改接 TWSE 官方 OpenAPI
+# 📈 股票：TWSE 官方 OpenAPI
 # =========================
 def fetch_twse_stock_day_all():
     return fetch_json("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", timeout=25)
@@ -213,7 +220,6 @@ def analyze_stock_with_twse(code: str, name: str, price_row: dict, val_row: dict
     close_near_high = (close_price >= (high_price - (high_price - low_price) * 0.25)) if high_price and low_price else False
 
     score = 50
-
     if change_pct >= 3:
         score += 16
     elif change_pct >= 1.5:
@@ -223,15 +229,12 @@ def analyze_stock_with_twse(code: str, name: str, price_row: dict, val_row: dict
 
     if close_near_high:
         score += 8
-
     if intraday_range_pct >= 4:
         score += 6
-
     if volume >= 30_000_000:
         score += 8
     elif volume >= 10_000_000:
         score += 4
-
     if pe > 0:
         score += 3
     if 0 < pb <= 8:
@@ -384,7 +387,6 @@ def split_direction_lines(lines):
         elif "北上" in line and line not in north:
             north.append(line)
         else:
-            # 沒明寫方向時，先盡量依內容放兩邊都可理解的摘要
             if is_south and line not in south:
                 south.append(line)
             if is_north and line not in north:
@@ -466,6 +468,136 @@ def get_traffic():
 
 
 # =========================
+# 📧 個人重要郵件（Gmail IMAP）
+# =========================
+def decode_mime_words(s):
+    if not s:
+        return ""
+    parts = decode_header(s)
+    out = []
+    for text, enc in parts:
+        if isinstance(text, bytes):
+            try:
+                out.append(text.decode(enc or "utf-8", errors="ignore"))
+            except Exception:
+                out.append(text.decode("utf-8", errors="ignore"))
+        else:
+            out.append(text)
+    return "".join(out).strip()
+
+
+def extract_email_address(from_text: str) -> str:
+    m = re.search(r"<([^>]+)>", from_text or "")
+    if m:
+        return m.group(1).strip().lower()
+    return (from_text or "").strip().lower()
+
+
+def is_promo_mail(sender: str, subject: str) -> bool:
+    text = f"{sender} {subject}".lower()
+
+    promo_keywords = [
+        "sale", "promo", "promotion", "newsletter", "discount", "coupon",
+        "優惠", "促銷", "折扣", "限時", "特價", "廣告", "電子報",
+        "雙11", "雙 11", "免運", "搶購", "週年慶", "black friday",
+        "cyber monday", "618", "購物節", "momo", "pchome", "蝦皮"
+    ]
+    promo_senders = [
+        "noreply", "no-reply", "newsletter", "mailer-daemon",
+        "marketing", "edm", "notification", "news@", "promo@"
+    ]
+
+    if any(k in text for k in promo_keywords):
+        return True
+    if any(k in text for k in promo_senders):
+        return True
+    return False
+
+
+def get_personal_emails(limit: int = 3):
+    import os
+
+    email_account = os.environ.get("EMAIL_ACCOUNT", EMAIL_ACCOUNT)
+    app_password = os.environ.get("EMAIL_APP_PASSWORD", "")
+
+    if not email_account or not app_password:
+        return {
+            "enabled": False,
+            "items": [],
+            "error": "EMAIL_ACCOUNT 或 EMAIL_APP_PASSWORD 未設定",
+        }
+
+    try:
+        mail = imaplib.IMAP4_SSL("imap.gmail.com", 993)
+        mail.login(email_account, app_password)
+
+        # Gmail IMAP 支援 X-GM-RAW，可直接用 Gmail 搜尋語法
+        raw_query = (
+            'in:inbox newer_than:2d '
+            '-category:promotions -category:social -in:spam -in:trash '
+            '-from:noreply -from:no-reply -from:newsletter -from:mailer-daemon'
+        )
+
+        status, data = mail.uid("SEARCH", "X-GM-RAW", f'"{raw_query}"')
+        if status != "OK":
+            mail.logout()
+            return {
+                "enabled": True,
+                "items": [],
+                "error": "搜尋失敗",
+            }
+
+        uids = data[0].split()
+        uids = uids[-20:]  # 最近 20 封中挑重要的
+
+        selected = []
+        seen = set()
+
+        for uid in reversed(uids):
+            status, msg_data = mail.uid("FETCH", uid, "(RFC822)")
+            if status != "OK" or not msg_data or not msg_data[0]:
+                continue
+
+            raw_email = msg_data[0][1]
+            msg = email.message_from_bytes(raw_email)
+
+            subject = decode_mime_words(msg.get("Subject", "（無主旨）"))
+            sender = decode_mime_words(msg.get("From", "未知寄件者"))
+            sender_email = extract_email_address(sender)
+
+            if is_promo_mail(sender, subject):
+                continue
+
+            fp = f"{sender_email}|{subject}".lower()
+            if fp in seen:
+                continue
+            seen.add(fp)
+
+            selected.append({
+                "sender": sender,
+                "subject": subject or "（無主旨）",
+            })
+
+            if len(selected) >= limit:
+                break
+
+        mail.logout()
+
+        return {
+            "enabled": True,
+            "items": selected,
+            "error": "",
+        }
+
+    except Exception as e:
+        return {
+            "enabled": True,
+            "items": [],
+            "error": type(e).__name__,
+        }
+
+
+# =========================
 # 💡 AI 總結
 # =========================
 def build_ai_summary(stocks):
@@ -497,13 +629,7 @@ def build_ai_summary(stocks):
 # HTML
 # =========================
 def esc_html(text: str) -> str:
-    return (
-        str(text)
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-    )
+    return html_lib.escape(str(text))
 
 
 def generate_html():
@@ -511,6 +637,7 @@ def generate_html():
     news = get_all_news()
     stocks = get_stocks()
     traffic = get_traffic()
+    personal_emails = get_personal_emails(limit=3)
     ai_summary = build_ai_summary(stocks)
 
     html = f"""<!doctype html>
@@ -522,7 +649,7 @@ def generate_html():
 body {{ font-family: Arial, "Noto Sans TC", sans-serif; padding: 24px; color: #222; }}
 .card {{ border: 1px solid #ddd; border-radius: 16px; padding: 16px; margin-bottom: 16px; }}
 .section-title {{ font-size: 18px; font-weight: 700; margin-bottom: 10px; }}
-.weather-row, .stock-row, .news-row, .traffic-row {{ margin: 8px 0; }}
+.weather-row, .stock-row, .news-row, .traffic-row, .mail-row {{ margin: 8px 0; }}
 .small {{ color: #666; font-size: 13px; display:block; margin-top:4px; }}
 .traffic-block {{ margin-top: 10px; padding-top: 10px; border-top: 1px dashed #ddd; }}
 </style>
@@ -575,6 +702,23 @@ body {{ font-family: Arial, "Noto Sans TC", sans-serif; padding: 24px; color: #2
   </div>
 
   <div class="traffic-row small">來源：{esc_html(traffic.get("source", ""))}</div>
+</div>
+
+<div class="card personal-mails">
+  <div class="section-title">📧 個人重要郵件</div>
+  {
+      ''.join(
+          f'''
+          <div class="mail-row mail-item">
+            <span class="mail-sender">{esc_html(m["sender"])}</span>｜
+            <span class="mail-subject">{esc_html(m["subject"])}</span>
+          </div>
+          '''
+          for m in personal_emails.get("items", [])
+      )
+      if personal_emails.get("items") else
+      f'<div class="mail-row small">{esc_html(personal_emails.get("error", "目前沒有重要郵件"))}</div>'
+  }
 </div>
 
 <div class="card news">
