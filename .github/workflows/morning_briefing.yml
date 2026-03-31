@@ -28,6 +28,9 @@ jobs:
 
       - name: Generate HTML
         run: python generate_briefing.py
+        env:
+          EMAIL_ACCOUNT: ${{ secrets.EMAIL_ACCOUNT }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
 
       - name: Debug files
         run: ls -lah
