@@ -24,6 +24,11 @@ STOCKS = [
     {"name": "廣達", "code": "2382"},
 ]
 
+INDICES = [
+    {"name": "韓股KOSPI", "symbol": "^KS11"},
+    {"name": "日股日經225", "symbol": "^N225"},
+]
+
 NEWS_TOPICS = [
     ("ai", "AI 台灣 OR 人工智慧 台灣"),
     ("youtube", "YouTube 台灣 OR Google 台灣"),
@@ -328,6 +333,47 @@ def get_stocks():
             "pb": 0,
             "yield": 0,
         } for s in STOCKS]
+
+
+# =========================
+# 🌏 國際大盤指數
+# =========================
+def get_indices():
+    result = []
+    for idx in INDICES:
+        try:
+            url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={idx['symbol']}"
+            r = requests.get(url, headers=HEADERS, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+
+            quote = data.get("quoteResponse", {}).get("result", [{}])[0]
+
+            current_price = to_float(quote.get("regularMarketPrice"), 0)
+            change = to_float(quote.get("regularMarketChange"), 0)
+            change_pct = to_float(quote.get("regularMarketChangePercent"), 0)
+
+            emoji = "🔴" if change >= 0 else "🔻"
+
+            result.append({
+                "name": idx["name"],
+                "symbol": idx["symbol"],
+                "price": f"{current_price:,.0f}" if current_price else "--",
+                "change": f"{change:+.0f}" if change else "--",
+                "change_pct": round(change_pct, 2),
+                "emoji": emoji,
+            })
+        except Exception as e:
+            result.append({
+                "name": idx["name"],
+                "symbol": idx["symbol"],
+                "price": "--",
+                "change": "--",
+                "change_pct": 0.0,
+                "emoji": "⚪",
+            })
+
+    return result
 
 
 # =========================
@@ -636,6 +682,7 @@ def generate_html():
     weather_list = get_weather_list()
     news = get_all_news()
     stocks = get_stocks()
+    indices = get_indices()
     traffic = get_traffic()
     personal_emails = get_personal_emails(limit=3)
     ai_summary = build_ai_summary(stocks)
@@ -685,6 +732,18 @@ body {{ font-family: Arial, "Noto Sans TC", sans-serif; padding: 24px; color: #2
       </div>
       '''
       for s in stocks
+  )}
+</div>
+
+<div class="card indices">
+  <div class="section-title">🌏 國際大盤指數</div>
+  {''.join(
+      f'''
+      <div class="index-row stock-row">
+        <span class="index-name">{esc_html(idx["emoji"])} {esc_html(idx["name"])}：{esc_html(idx["price"])} {idx["change"]} {idx["change_pct"]:+.2f}%</span>
+      </div>
+      '''
+      for idx in indices
   )}
 </div>
 

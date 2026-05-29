@@ -51,6 +51,7 @@ def parse_briefing(html_path: Path) -> dict:
         "date": _text(soup.find("title")) or date.today().strftime("%Y-%m-%d"),
         "weather_list": [],
         "stocks": [],
+        "indices": [],
         "traffic": {
             "south_status": "",
             "north_status": "",
@@ -78,6 +79,11 @@ def parse_briefing(html_path: Path) -> dict:
                 "line": task_name,
                 "meta": task_meta,
             })
+
+    for item in soup.select(".indices .index-row"):
+        index_name = _text(item.select_one(".index-name"))
+        if index_name:
+            result["indices"].append(index_name)
 
     south_title = soup.select_one('.traffic .southbound .traffic-title[data-dir="south"]')
     north_title = soup.select_one('.traffic .northbound .traffic-title[data-dir="north"]')
@@ -150,6 +156,12 @@ def build_message(data: dict) -> str:
             lines.append(f"│ {esc(s['line'])}")
             if s.get("meta"):
                 lines.append(f"│ └─ {esc(s['meta'])}")
+        lines += ["╰────────────────", ""]
+
+    if data.get("indices"):
+        lines += ["╭─ 🌏 *國際大盤指數*"]
+        for idx in data["indices"]:
+            lines.append(f"│ {esc(idx)}")
         lines += ["╰────────────────", ""]
 
     traffic = data.get("traffic", {})
