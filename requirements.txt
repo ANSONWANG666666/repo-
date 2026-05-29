@@ -3,3 +3,4 @@ beautifulsoup4
 feedparser
 lxml
 html5lib
+yfinance

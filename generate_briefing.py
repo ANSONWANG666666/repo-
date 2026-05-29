@@ -339,31 +339,42 @@ def get_stocks():
 # 🌏 國際大盤指數
 # =========================
 def get_indices():
+    import sys
     result = []
-    for idx in INDICES:
-        try:
-            url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={idx['symbol']}"
-            r = requests.get(url, headers=HEADERS, timeout=15)
-            r.raise_for_status()
-            data = r.json()
+    try:
+        import yfinance as yf
+        for idx in INDICES:
+            try:
+                ticker = yf.Ticker(idx['symbol'])
+                info = ticker.info if hasattr(ticker, 'info') else {}
 
-            quote = data.get("quoteResponse", {}).get("result", [{}])[0]
+                current_price = to_float(info.get("currentPrice") or info.get("regularMarketPrice"), 0)
+                change = to_float(info.get("regularMarketChange", 0), 0)
+                change_pct = to_float(info.get("regularMarketChangePercent", 0), 0)
 
-            current_price = to_float(quote.get("regularMarketPrice"), 0)
-            change = to_float(quote.get("regularMarketChange"), 0)
-            change_pct = to_float(quote.get("regularMarketChangePercent"), 0)
+                emoji = "🔴" if change >= 0 else "🔻"
 
-            emoji = "🔴" if change >= 0 else "🔻"
-
-            result.append({
-                "name": idx["name"],
-                "symbol": idx["symbol"],
-                "price": f"{current_price:,.0f}" if current_price else "--",
-                "change": f"{change:+.0f}" if change else "--",
-                "change_pct": round(change_pct, 2),
-                "emoji": emoji,
-            })
-        except Exception as e:
+                result.append({
+                    "name": idx["name"],
+                    "symbol": idx["symbol"],
+                    "price": f"{current_price:,.0f}" if current_price else "--",
+                    "change": f"{change:+.0f}" if change else "--",
+                    "change_pct": round(change_pct, 2),
+                    "emoji": emoji,
+                })
+            except Exception as e:
+                print(f"⚠️ 無法取得 {idx['name']} 數據: {type(e).__name__}", file=sys.stderr)
+                result.append({
+                    "name": idx["name"],
+                    "symbol": idx["symbol"],
+                    "price": "--",
+                    "change": "--",
+                    "change_pct": 0.0,
+                    "emoji": "⚪",
+                })
+    except ImportError:
+        print("⚠️ yfinance 模組未安裝，使用預設值", file=sys.stderr)
+        for idx in INDICES:
             result.append({
                 "name": idx["name"],
                 "symbol": idx["symbol"],
