@@ -388,6 +388,87 @@ def get_indices():
 
 
 # =========================
+# 😱 CNN 恐懼與貪婪指數 (Fear & Greed Index)
+# =========================
+def _fng_label(rating: str, score: float):
+    """將 CNN 英文 rating 轉成中文標籤與對應 emoji。"""
+    rating = (rating or "").strip().lower()
+    mapping = {
+        "extreme fear": ("極度恐懼", "🟥"),
+        "fear": ("恐懼", "🟧"),
+        "neutral": ("中性", "🟨"),
+        "greed": ("貪婪", "🟩"),
+        "extreme greed": ("極度貪婪", "🟦"),
+    }
+    if rating in mapping:
+        return mapping[rating]
+
+    # 沒有 rating 時依分數判斷
+    if score <= 25:
+        return ("極度恐懼", "🟥")
+    if score <= 45:
+        return ("恐懼", "🟧")
+    if score <= 55:
+        return ("中性", "🟨")
+    if score <= 75:
+        return ("貪婪", "🟩")
+    return ("極度貪婪", "🟦")
+
+
+def get_fear_greed():
+    """取得 CNN Fear & Greed Index（美股市場情緒指標）。"""
+    import sys
+    fng_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://edition.cnn.com/markets/fear-and-greed",
+        "Origin": "https://edition.cnn.com",
+    }
+    try:
+        r = requests.get(
+            "https://production.dataviz.cnn.io/index/fearandgreed/graphdata",
+            headers=fng_headers,
+            timeout=20,
+        )
+        r.raise_for_status()
+        data = r.json()
+        fng = data.get("fear_and_greed", {})
+
+        score = to_float(fng.get("score"), 0.0)
+        rating = fng.get("rating", "")
+        label, emoji = _fng_label(rating, score)
+
+        prev_close = to_float(fng.get("previous_close"), 0.0)
+        prev_week = to_float(fng.get("previous_1_week"), 0.0)
+        prev_month = to_float(fng.get("previous_1_month"), 0.0)
+
+        return {
+            "ok": True,
+            "name": "CNN 恐懼與貪婪指數",
+            "score": int(round(score)),
+            "label": label,
+            "emoji": emoji,
+            "prev_close": int(round(prev_close)) if prev_close else None,
+            "prev_week": int(round(prev_week)) if prev_week else None,
+            "prev_month": int(round(prev_month)) if prev_month else None,
+        }
+    except Exception as e:
+        print(f"⚠️ 無法取得 CNN 恐懼與貪婪指數: {type(e).__name__}", file=sys.stderr)
+        return {
+            "ok": False,
+            "name": "CNN 恐懼與貪婪指數",
+            "score": "--",
+            "label": "資料取得中",
+            "emoji": "⚪",
+            "prev_close": None,
+            "prev_week": None,
+            "prev_month": None,
+        }
+
+
+# =========================
 # 🚗 國五：南下 / 北上分開顯示
 # =========================
 def normalize_traffic_status(text: str) -> str:
@@ -694,9 +775,19 @@ def generate_html():
     news = get_all_news()
     stocks = get_stocks()
     indices = get_indices()
+    fear_greed = get_fear_greed()
     traffic = get_traffic()
     personal_emails = get_personal_emails(limit=3)
     ai_summary = build_ai_summary(stocks)
+
+    fng_parts = []
+    if fear_greed.get("prev_close") is not None:
+        fng_parts.append(f"昨日 {fear_greed['prev_close']}")
+    if fear_greed.get("prev_week") is not None:
+        fng_parts.append(f"上週 {fear_greed['prev_week']}")
+    if fear_greed.get("prev_month") is not None:
+        fng_parts.append(f"上月 {fear_greed['prev_month']}")
+    fng_sub = " / ".join(fng_parts) if fng_parts else "0=極度恐懼 100=極度貪婪"
 
     html = f"""<!doctype html>
 <html lang="zh-Hant">
@@ -756,6 +847,14 @@ body {{ font-family: Arial, "Noto Sans TC", sans-serif; padding: 24px; color: #2
       '''
       for idx in indices
   )}
+</div>
+
+<div class="card fear-greed">
+  <div class="section-title">😱 市場情緒指標</div>
+  <div class="fng-row stock-row">
+    <span class="fng-name">{esc_html(fear_greed["emoji"])} {esc_html(fear_greed["name"])}：{esc_html(fear_greed["score"])}（{esc_html(fear_greed["label"])}）</span>
+    <span class="fng-meta small">{esc_html(fng_sub)}</span>
+  </div>
 </div>
 
 <div class="card traffic">

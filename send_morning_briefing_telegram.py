@@ -52,6 +52,7 @@ def parse_briefing(html_path: Path) -> dict:
         "weather_list": [],
         "stocks": [],
         "indices": [],
+        "fear_greed": {"name": "", "meta": ""},
         "traffic": {
             "south_status": "",
             "north_status": "",
@@ -84,6 +85,13 @@ def parse_briefing(html_path: Path) -> dict:
         index_name = _text(item.select_one(".index-name"))
         if index_name:
             result["indices"].append(index_name)
+
+    fng_row = soup.select_one(".fear-greed .fng-row")
+    if fng_row:
+        result["fear_greed"] = {
+            "name": _text(fng_row.select_one(".fng-name")),
+            "meta": _text(fng_row.select_one(".fng-meta")),
+        }
 
     south_title = soup.select_one('.traffic .southbound .traffic-title[data-dir="south"]')
     north_title = soup.select_one('.traffic .northbound .traffic-title[data-dir="north"]')
@@ -162,6 +170,14 @@ def build_message(data: dict) -> str:
         lines += ["╭─ 🌏 *國際大盤指數*"]
         for idx in data["indices"]:
             lines.append(f"│ {esc(idx)}")
+        lines += ["╰────────────────", ""]
+
+    fng = data.get("fear_greed", {})
+    if fng and fng.get("name"):
+        lines += ["╭─ 😱 *市場情緒指標*"]
+        lines.append(f"│ {esc(fng['name'])}")
+        if fng.get("meta"):
+            lines.append(f"│ └─ {esc(fng['meta'])}")
         lines += ["╰────────────────", ""]
 
     traffic = data.get("traffic", {})
