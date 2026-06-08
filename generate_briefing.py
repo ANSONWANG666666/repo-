@@ -469,108 +469,22 @@ def get_fear_greed():
 
 
 # =========================
-# 🇹🇼 台股 MM 恐懼與貪婪指數 vs 加權指數 (MacroMicro)
+# 🇹🇼 台股恐懼與貪婪指數（自製，資料來源：yfinance ^TWII 加權指數）
 # =========================
-MM_CHART_URL = (
-    "https://www.macromicro.me/collections/46/tw-stock-relative/"
-    "128747/taiwan-mm-fear-and-greed-index-vs-taiex"
-)
-MM_CHART_ID = "128747"
-
-
-def _mm_extract_stk(html: str):
-    """從 MacroMicro 頁面 HTML 取出 stk token。"""
-    if not html:
-        return None
-    for pat in (
-        r'stk["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-\.]{16,})',
-        r'"stk"\s*:\s*"([A-Za-z0-9_\-\.]{16,})"',
-        r'App\.stk\s*=\s*["\']([A-Za-z0-9_\-\.]{16,})',
-    ):
-        m = re.search(pat, html)
-        if m:
-            return m.group(1)
-    return None
-
-
-def _mm_is_challenge(html: str) -> bool:
-    """判斷回傳的是否為 Cloudflare 驗證挑戰頁。"""
-    low = (html or "").lower()
-    return any(x in low for x in (
-        "just a moment", "cf-challenge", "challenge-platform",
-        "turnstile", "attention required", "cloudflare to restrict",
-        "_cf_chl", "enable javascript and cookies",
-    ))
-
-
-def _mm_fetch_series():
-    """回傳 MacroMicro 圖表的 series 資料（list），失敗則 raise。
-
-    依序嘗試：
-      1) curl_cffi（模擬真實瀏覽器 TLS 指紋，最能繞過資料中心 IP 的 Cloudflare）
-      2) cloudscraper（備援）
-    """
-    import sys
-    data_url = f"https://www.macromicro.me/charts/data/{MM_CHART_ID}"
-    diags = []
-
-    def _pull(get_text, get_json):
-        """共用流程：載頁面 → 取 stk → 打 API → 回 series。"""
-        page = get_text(MM_CHART_URL)
-        stk = _mm_extract_stk(page)
-        if not stk:
-            kind = "Cloudflare挑戰頁" if _mm_is_challenge(page) else "無stk"
-            raise ValueError(f"{kind}(len={len(page or '')})")
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": "Bearer " + stk,
-            "Docref": MM_CHART_URL,
-            "Referer": MM_CHART_URL,
-            "X-Requested-With": "XMLHttpRequest",
-            "Accept": "application/json, text/plain, */*",
-        }
-        data = get_json(data_url, headers)
-        return data["data"][f"c:{MM_CHART_ID}"]["series"]
-
-    # 策略 1：curl_cffi 多種瀏覽器指紋
-    try:
-        from curl_cffi import requests as creq
-        for imp in ("chrome", "chrome120", "chrome110", "safari15_5"):
-            try:
-                s = creq.Session(impersonate=imp)
-                return _pull(
-                    lambda u: s.get(u, timeout=40).text,
-                    lambda u, h: s.get(u, headers=h, timeout=40).json(),
-                )
-            except Exception as e:
-                diags.append(f"curl_cffi[{imp}]:{type(e).__name__}:{e}")
-    except ImportError:
-        diags.append("curl_cffi未安裝")
-
-    # 策略 2：cloudscraper 備援
-    try:
-        import cloudscraper
-        scraper = cloudscraper.create_scraper(
-            browser={"browser": "chrome", "platform": "windows", "mobile": False}
-        )
-        return _pull(
-            lambda u: scraper.get(u, timeout=40).text,
-            lambda u, h: scraper.get(u, headers=h, timeout=40).json(),
-        )
-    except ImportError:
-        diags.append("cloudscraper未安裝")
-    except Exception as e:
-        diags.append(f"cloudscraper:{type(e).__name__}:{e}")
-
-    raise RuntimeError(" | ".join(diags) or "未知錯誤")
-
-
 def get_tw_fear_greed():
-    """取得 MacroMicro 台灣 MM 恐懼與貪婪指數 與 加權指數。"""
+    """以加權指數（^TWII）免費歷史資料，計算台股版恐懼與貪婪指數。
+
+    綜合四項指標（各 0–100 後平均）：
+      1. 動能：收盤相對 125 日均線乖離
+      2. RSI(14)：相對強弱指標
+      3. 波動度：20 日報酬波動（近一年區間反向，高波動 = 恐懼）
+      4. 52 週位置：收盤在近一年高低點之間的相對位置
+    並取加權指數最新收盤與當日漲跌。完全使用 yfinance，雲端可穩定自動運行。
+    """
     import sys
     fail = {
         "ok": False,
-        "name": "台股 MM 恐懼與貪婪指數",
+        "name": "台股恐懼與貪婪指數",
         "score": "--",
         "label": "資料取得中",
         "emoji": "⚪",
@@ -583,24 +497,61 @@ def get_tw_fear_greed():
         "taiex_emoji": "⚪",
     }
     try:
-        series = _mm_fetch_series()
-        fng_series = series[0]    # 台灣 MM 恐懼與貪婪指數
-        taiex_series = series[1]  # 加權指數 TAIEX
+        import yfinance as yf
+        import pandas as pd
 
-        fng_date, fng_val = fng_series[-1][0], to_float(fng_series[-1][1])
-        fng_prev_val = to_float(fng_series[-2][1]) if len(fng_series) >= 2 else None
+        df = yf.Ticker("^TWII").history(period="1y", auto_adjust=False)
+        if df is None or df.empty or "Close" not in df:
+            raise ValueError("無 ^TWII 歷史資料")
+
+        close = df["Close"].dropna()
+        if len(close) < 60:
+            raise ValueError("^TWII 歷史資料不足")
+        ret = close.pct_change()
+
+        # 1) 動能：收盤 vs 125 日均線乖離（±10% 約對應 ±30 分）
+        sma = close.rolling(125, min_periods=20).mean()
+        mom_score = (50 + (close / sma - 1.0) * 300).clip(0, 100)
+
+        # 2) RSI(14)
+        delta = close.diff()
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = (-delta.clip(upper=0)).rolling(14).mean()
+        rs = gain / loss.replace(0, 1e-9)
+        rsi = 100 - 100 / (1 + rs)
+
+        # 3) 波動度：20 日報酬標準差，近一年區間反向（高波動 = 恐懼）
+        vol = ret.rolling(20).std()
+        vmin = vol.rolling(252, min_periods=60).min()
+        vmax = vol.rolling(252, min_periods=60).max()
+        vol_score = (100 * (1 - (vol - vmin) / (vmax - vmin).replace(0, 1e-9))).clip(0, 100)
+
+        # 4) 52 週位置
+        hi = close.rolling(252, min_periods=60).max()
+        lo = close.rolling(252, min_periods=60).min()
+        pos_score = (100 * (close - lo) / (hi - lo).replace(0, 1e-9)).clip(0, 100)
+
+        score_series = pd.concat(
+            [mom_score, rsi, vol_score, pos_score], axis=1
+        ).mean(axis=1).dropna()
+        if score_series.empty:
+            raise ValueError("指標計算資料不足")
+
+        fng_val = float(score_series.iloc[-1])
+        fng_prev_val = float(score_series.iloc[-2]) if len(score_series) >= 2 else None
 
         label, emoji = _fng_label("", fng_val)
         prev_label = _fng_label("", fng_prev_val)[0] if fng_prev_val is not None else ""
 
-        taiex_now = to_float(taiex_series[-1][1])
-        taiex_prev = to_float(taiex_series[-2][1]) if len(taiex_series) >= 2 else taiex_now
+        taiex_now = float(close.iloc[-1])
+        taiex_prev = float(close.iloc[-2]) if len(close) >= 2 else taiex_now
         taiex_change = taiex_now - taiex_prev
         taiex_pct = (taiex_change / taiex_prev * 100) if taiex_prev else 0.0
+        fng_date = close.index[-1].strftime("%Y-%m-%d")
 
         return {
             "ok": True,
-            "name": "台股 MM 恐懼與貪婪指數",
+            "name": "台股恐懼與貪婪指數",
             "score": int(round(fng_val)),
             "label": label,
             "emoji": emoji,
@@ -613,8 +564,9 @@ def get_tw_fear_greed():
             "taiex_emoji": "🔴" if taiex_change >= 0 else "🔻",
         }
     except Exception as e:
-        print(f"⚠️ 無法取得台股 MM 恐懼與貪婪指數: {type(e).__name__}: {e}", file=sys.stderr)
+        print(f"⚠️ 無法計算台股恐懼與貪婪指數: {type(e).__name__}: {e}", file=sys.stderr)
         return fail
+
 
 
 # =========================
