@@ -5,3 +5,4 @@ lxml
 html5lib
 yfinance
 cloudscraper
+curl_cffi

@@ -478,14 +478,95 @@ MM_CHART_URL = (
 MM_CHART_ID = "128747"
 
 
-def get_tw_fear_greed():
-    """取得 MacroMicro 台灣 MM 恐懼與貪婪指數 與 加權指數。
+def _mm_extract_stk(html: str):
+    """從 MacroMicro 頁面 HTML 取出 stk token。"""
+    if not html:
+        return None
+    for pat in (
+        r'stk["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-\.]{16,})',
+        r'"stk"\s*:\s*"([A-Za-z0-9_\-\.]{16,})"',
+        r'App\.stk\s*=\s*["\']([A-Za-z0-9_\-\.]{16,})',
+    ):
+        m = re.search(pat, html)
+        if m:
+            return m.group(1)
+    return None
 
-    MacroMicro 有 Cloudflare 防護且資料 API 需授權，作法：
-      1. 用 cloudscraper 載入圖表頁（繞過 Cloudflare，取得 cookie 與 stk token）
-      2. 帶 Authorization: Bearer <stk> 呼叫 /charts/data/<id>
-      3. 取兩條序列（恐懼貪婪指數、加權指數）的最新值
+
+def _mm_is_challenge(html: str) -> bool:
+    """判斷回傳的是否為 Cloudflare 驗證挑戰頁。"""
+    low = (html or "").lower()
+    return any(x in low for x in (
+        "just a moment", "cf-challenge", "challenge-platform",
+        "turnstile", "attention required", "cloudflare to restrict",
+        "_cf_chl", "enable javascript and cookies",
+    ))
+
+
+def _mm_fetch_series():
+    """回傳 MacroMicro 圖表的 series 資料（list），失敗則 raise。
+
+    依序嘗試：
+      1) curl_cffi（模擬真實瀏覽器 TLS 指紋，最能繞過資料中心 IP 的 Cloudflare）
+      2) cloudscraper（備援）
     """
+    import sys
+    data_url = f"https://www.macromicro.me/charts/data/{MM_CHART_ID}"
+    diags = []
+
+    def _pull(get_text, get_json):
+        """共用流程：載頁面 → 取 stk → 打 API → 回 series。"""
+        page = get_text(MM_CHART_URL)
+        stk = _mm_extract_stk(page)
+        if not stk:
+            kind = "Cloudflare挑戰頁" if _mm_is_challenge(page) else "無stk"
+            raise ValueError(f"{kind}(len={len(page or '')})")
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + stk,
+            "Docref": MM_CHART_URL,
+            "Referer": MM_CHART_URL,
+            "X-Requested-With": "XMLHttpRequest",
+            "Accept": "application/json, text/plain, */*",
+        }
+        data = get_json(data_url, headers)
+        return data["data"][f"c:{MM_CHART_ID}"]["series"]
+
+    # 策略 1：curl_cffi 多種瀏覽器指紋
+    try:
+        from curl_cffi import requests as creq
+        for imp in ("chrome", "chrome120", "chrome110", "safari15_5"):
+            try:
+                s = creq.Session(impersonate=imp)
+                return _pull(
+                    lambda u: s.get(u, timeout=40).text,
+                    lambda u, h: s.get(u, headers=h, timeout=40).json(),
+                )
+            except Exception as e:
+                diags.append(f"curl_cffi[{imp}]:{type(e).__name__}:{e}")
+    except ImportError:
+        diags.append("curl_cffi未安裝")
+
+    # 策略 2：cloudscraper 備援
+    try:
+        import cloudscraper
+        scraper = cloudscraper.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "mobile": False}
+        )
+        return _pull(
+            lambda u: scraper.get(u, timeout=40).text,
+            lambda u, h: scraper.get(u, headers=h, timeout=40).json(),
+        )
+    except ImportError:
+        diags.append("cloudscraper未安裝")
+    except Exception as e:
+        diags.append(f"cloudscraper:{type(e).__name__}:{e}")
+
+    raise RuntimeError(" | ".join(diags) or "未知錯誤")
+
+
+def get_tw_fear_greed():
+    """取得 MacroMicro 台灣 MM 恐懼與貪婪指數 與 加權指數。"""
     import sys
     fail = {
         "ok": False,
@@ -502,40 +583,8 @@ def get_tw_fear_greed():
         "taiex_emoji": "⚪",
     }
     try:
-        import cloudscraper
-    except ImportError:
-        print("⚠️ cloudscraper 模組未安裝，略過台股 MM 指數", file=sys.stderr)
-        return fail
-
-    try:
-        scraper = cloudscraper.create_scraper(
-            browser={"browser": "chrome", "platform": "windows", "mobile": False}
-        )
-        page = scraper.get(MM_CHART_URL, timeout=40).text
-        m = re.search(r'stk["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-\.]+)', page)
-        if not m:
-            raise ValueError("找不到 stk token")
-        stk = m.group(1)
-
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": "Bearer " + stk,
-            "Docref": MM_CHART_URL,
-            "Referer": MM_CHART_URL,
-            "X-Requested-With": "XMLHttpRequest",
-            "Accept": "application/json, text/plain, */*",
-        }
-        resp = scraper.get(
-            f"https://www.macromicro.me/charts/data/{MM_CHART_ID}",
-            headers=headers,
-            timeout=40,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-        block = data["data"][f"c:{MM_CHART_ID}"]
-        series = block["series"]
-        fng_series = series[0]   # 台灣 MM 恐懼與貪婪指數
+        series = _mm_fetch_series()
+        fng_series = series[0]    # 台灣 MM 恐懼與貪婪指數
         taiex_series = series[1]  # 加權指數 TAIEX
 
         fng_date, fng_val = fng_series[-1][0], to_float(fng_series[-1][1])
