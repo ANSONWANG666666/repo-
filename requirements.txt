@@ -4,3 +4,4 @@ feedparser
 lxml
 html5lib
 yfinance
+cloudscraper

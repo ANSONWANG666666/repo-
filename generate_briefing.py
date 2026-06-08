@@ -469,6 +469,106 @@ def get_fear_greed():
 
 
 # =========================
+# 🇹🇼 台股 MM 恐懼與貪婪指數 vs 加權指數 (MacroMicro)
+# =========================
+MM_CHART_URL = (
+    "https://www.macromicro.me/collections/46/tw-stock-relative/"
+    "128747/taiwan-mm-fear-and-greed-index-vs-taiex"
+)
+MM_CHART_ID = "128747"
+
+
+def get_tw_fear_greed():
+    """取得 MacroMicro 台灣 MM 恐懼與貪婪指數 與 加權指數。
+
+    MacroMicro 有 Cloudflare 防護且資料 API 需授權，作法：
+      1. 用 cloudscraper 載入圖表頁（繞過 Cloudflare，取得 cookie 與 stk token）
+      2. 帶 Authorization: Bearer <stk> 呼叫 /charts/data/<id>
+      3. 取兩條序列（恐懼貪婪指數、加權指數）的最新值
+    """
+    import sys
+    fail = {
+        "ok": False,
+        "name": "台股 MM 恐懼與貪婪指數",
+        "score": "--",
+        "label": "資料取得中",
+        "emoji": "⚪",
+        "prev": None,
+        "prev_label": "",
+        "date": "",
+        "taiex": "--",
+        "taiex_change": "--",
+        "taiex_pct": 0.0,
+        "taiex_emoji": "⚪",
+    }
+    try:
+        import cloudscraper
+    except ImportError:
+        print("⚠️ cloudscraper 模組未安裝，略過台股 MM 指數", file=sys.stderr)
+        return fail
+
+    try:
+        scraper = cloudscraper.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "mobile": False}
+        )
+        page = scraper.get(MM_CHART_URL, timeout=40).text
+        m = re.search(r'stk["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-\.]+)', page)
+        if not m:
+            raise ValueError("找不到 stk token")
+        stk = m.group(1)
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + stk,
+            "Docref": MM_CHART_URL,
+            "Referer": MM_CHART_URL,
+            "X-Requested-With": "XMLHttpRequest",
+            "Accept": "application/json, text/plain, */*",
+        }
+        resp = scraper.get(
+            f"https://www.macromicro.me/charts/data/{MM_CHART_ID}",
+            headers=headers,
+            timeout=40,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        block = data["data"][f"c:{MM_CHART_ID}"]
+        series = block["series"]
+        fng_series = series[0]   # 台灣 MM 恐懼與貪婪指數
+        taiex_series = series[1]  # 加權指數 TAIEX
+
+        fng_date, fng_val = fng_series[-1][0], to_float(fng_series[-1][1])
+        fng_prev_val = to_float(fng_series[-2][1]) if len(fng_series) >= 2 else None
+
+        label, emoji = _fng_label("", fng_val)
+        prev_label = _fng_label("", fng_prev_val)[0] if fng_prev_val is not None else ""
+
+        taiex_now = to_float(taiex_series[-1][1])
+        taiex_prev = to_float(taiex_series[-2][1]) if len(taiex_series) >= 2 else taiex_now
+        taiex_change = taiex_now - taiex_prev
+        taiex_pct = (taiex_change / taiex_prev * 100) if taiex_prev else 0.0
+
+        return {
+            "ok": True,
+            "name": "台股 MM 恐懼與貪婪指數",
+            "score": int(round(fng_val)),
+            "label": label,
+            "emoji": emoji,
+            "prev": int(round(fng_prev_val)) if fng_prev_val is not None else None,
+            "prev_label": prev_label,
+            "date": fng_date,
+            "taiex": f"{taiex_now:,.0f}" if taiex_now else "--",
+            "taiex_change": f"{taiex_change:+,.0f}" if taiex_change else "0",
+            "taiex_pct": round(taiex_pct, 2),
+            "taiex_emoji": "🔴" if taiex_change >= 0 else "🔻",
+        }
+    except Exception as e:
+        print(f"⚠️ 無法取得台股 MM 恐懼與貪婪指數: {type(e).__name__}: {e}", file=sys.stderr)
+        return fail
+
+
+# =========================
 # 🚗 國五：南下 / 北上分開顯示
 # =========================
 def normalize_traffic_status(text: str) -> str:
@@ -776,6 +876,7 @@ def generate_html():
     stocks = get_stocks()
     indices = get_indices()
     fear_greed = get_fear_greed()
+    tw_fear_greed = get_tw_fear_greed()
     traffic = get_traffic()
     personal_emails = get_personal_emails(limit=3)
     ai_summary = build_ai_summary(stocks)
@@ -788,6 +889,18 @@ def generate_html():
     if fear_greed.get("prev_month") is not None:
         fng_parts.append(f"上月 {fear_greed['prev_month']}")
     fng_sub = " / ".join(fng_parts) if fng_parts else "0=極度恐懼 100=極度貪婪"
+
+    # 台股 MM 指數副標：前次數值 + 加權指數
+    tw_parts = []
+    if tw_fear_greed.get("prev") is not None:
+        prev_lbl = f"（{tw_fear_greed['prev_label']}）" if tw_fear_greed.get("prev_label") else ""
+        tw_parts.append(f"前次 {tw_fear_greed['prev']}{prev_lbl}")
+    if tw_fear_greed.get("taiex") not in (None, "--"):
+        tw_parts.append(
+            f"加權指數 {tw_fear_greed['taiex']} "
+            f"{tw_fear_greed['taiex_change']} {tw_fear_greed['taiex_pct']:+.2f}%"
+        )
+    tw_sub = " ｜ ".join(tw_parts) if tw_parts else "0=極度恐懼 100=極度貪婪"
 
     html = f"""<!doctype html>
 <html lang="zh-Hant">
@@ -854,6 +967,14 @@ body {{ font-family: Arial, "Noto Sans TC", sans-serif; padding: 24px; color: #2
   <div class="fng-row stock-row">
     <span class="fng-name">{esc_html(fear_greed["emoji"])} {esc_html(fear_greed["name"])}：{esc_html(fear_greed["score"])}（{esc_html(fear_greed["label"])}）</span>
     <span class="fng-meta small">{esc_html(fng_sub)}</span>
+  </div>
+</div>
+
+<div class="card tw-fear-greed">
+  <div class="section-title">🇹🇼 台股情緒指標</div>
+  <div class="twfng-row stock-row">
+    <span class="twfng-name">{esc_html(tw_fear_greed["emoji"])} {esc_html(tw_fear_greed["name"])}：{esc_html(tw_fear_greed["score"])}（{esc_html(tw_fear_greed["label"])}）</span>
+    <span class="twfng-meta small">{esc_html(tw_sub)}</span>
   </div>
 </div>
 
