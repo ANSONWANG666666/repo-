@@ -469,17 +469,44 @@ def get_fear_greed():
 
 
 # =========================
-# 🇹🇼 台股恐懼與貪婪指數（自製，資料來源：yfinance ^TWII 加權指數）
+# 🇹🇼 台股恐懼與貪婪指數（校準版，貼近 MacroMicro MM 指數）
 # =========================
-def get_tw_fear_greed():
-    """以加權指數（^TWII）免費歷史資料，計算台股版恐懼與貪婪指數。
+# 說明：MacroMicro 官方 MM 指數在雲端 IP 會被 Cloudflare 擋下，無法直接取得。
+# 因此以加權指數（^TWII，yfinance 免費資料）建構特徵，並以「線性回歸」對
+# MacroMicro 台灣 MM 恐懼與貪婪指數（近 3 年、726 個交易日）做一次性校準，
+# 得到下列係數（標準化線性模型，R²≈0.80、平均絕對誤差≈6.4）。
+# 雲端只需 yfinance 即可套用，方向與量級貼近 MM；屬估計值，非 MM 官方數字。
+TW_FNG_FEATURES = ["r1", "r5", "r10", "r20", "rsi", "ma60", "vol20", "volratio"]
+TW_FNG_INTERCEPT = 53.631665
+TW_FNG_COEF = [0.225492, 3.129087, 2.878829, 1.633002, 7.349767, 5.290639, -3.656927, -0.248778]
+TW_FNG_MU = [0.00141363, 0.00729884, 0.01454393, 0.02880505, 58.84206389, 0.03915552, 0.01218958, 0.94874548]
+TW_FNG_SD = [0.01387929, 0.02955986, 0.04106744, 0.0588246, 16.23967955, 0.0578041, 0.00638906, 0.47446619]
 
-    綜合四項指標（各 0–100 後平均）：
-      1. 動能：收盤相對 125 日均線乖離
-      2. RSI(14)：相對強弱指標
-      3. 波動度：20 日報酬波動（近一年區間反向，高波動 = 恐懼）
-      4. 52 週位置：收盤在近一年高低點之間的相對位置
-    並取加權指數最新收盤與當日漲跌。完全使用 yfinance，雲端可穩定自動運行。
+
+def _twii_features(close):
+    """由 ^TWII 收盤序列建構與校準時相同的特徵 DataFrame。"""
+    import pandas as pd
+    ret = close.pct_change()
+    f = pd.DataFrame(index=close.index)
+    f["r1"] = ret
+    f["r5"] = close.pct_change(5)
+    f["r10"] = close.pct_change(10)
+    f["r20"] = close.pct_change(20)
+    delta = close.diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    f["rsi"] = 100 - 100 / (1 + gain / loss.replace(0, 1e-9))
+    f["ma60"] = close / close.rolling(60).mean() - 1
+    f["vol20"] = ret.rolling(20).std()
+    f["volratio"] = ret.rolling(5).std() / ret.rolling(60).std().replace(0, 1e-9)
+    return f
+
+
+def get_tw_fear_greed():
+    """計算貼近 MacroMicro 的台股恐懼與貪婪指數，並取加權指數最新收盤與漲跌。
+
+    以 ^TWII 特徵套用已對 MM 校準的線性模型，輸出 0–100 分數。
+    完全使用 yfinance，GitHub Actions 可穩定自動運行。
     """
     import sys
     fail = {
@@ -498,42 +525,23 @@ def get_tw_fear_greed():
     }
     try:
         import yfinance as yf
-        import pandas as pd
 
-        df = yf.Ticker("^TWII").history(period="1y", auto_adjust=False)
+        df = yf.Ticker("^TWII").history(period="2y", auto_adjust=False)
         if df is None or df.empty or "Close" not in df:
             raise ValueError("無 ^TWII 歷史資料")
 
         close = df["Close"].dropna()
-        if len(close) < 60:
+        if len(close) < 70:
             raise ValueError("^TWII 歷史資料不足")
-        ret = close.pct_change()
 
-        # 1) 動能：收盤 vs 125 日均線乖離（±10% 約對應 ±30 分）
-        sma = close.rolling(125, min_periods=20).mean()
-        mom_score = (50 + (close / sma - 1.0) * 300).clip(0, 100)
+        feat = _twii_features(close)
 
-        # 2) RSI(14)
-        delta = close.diff()
-        gain = delta.clip(lower=0).rolling(14).mean()
-        loss = (-delta.clip(upper=0)).rolling(14).mean()
-        rs = gain / loss.replace(0, 1e-9)
-        rsi = 100 - 100 / (1 + rs)
-
-        # 3) 波動度：20 日報酬標準差，近一年區間反向（高波動 = 恐懼）
-        vol = ret.rolling(20).std()
-        vmin = vol.rolling(252, min_periods=60).min()
-        vmax = vol.rolling(252, min_periods=60).max()
-        vol_score = (100 * (1 - (vol - vmin) / (vmax - vmin).replace(0, 1e-9))).clip(0, 100)
-
-        # 4) 52 週位置
-        hi = close.rolling(252, min_periods=60).max()
-        lo = close.rolling(252, min_periods=60).min()
-        pos_score = (100 * (close - lo) / (hi - lo).replace(0, 1e-9)).clip(0, 100)
-
-        score_series = pd.concat(
-            [mom_score, rsi, vol_score, pos_score], axis=1
-        ).mean(axis=1).dropna()
+        # 套用標準化線性模型：score = intercept + Σ coef * (x - mu) / sd
+        score = feat[TW_FNG_FEATURES].copy()
+        for i, col in enumerate(TW_FNG_FEATURES):
+            score[col] = (score[col] - TW_FNG_MU[i]) / TW_FNG_SD[i] * TW_FNG_COEF[i]
+        score_series = (TW_FNG_INTERCEPT + score.sum(axis=1)).clip(0, 100)
+        score_series = score_series.dropna()
         if score_series.empty:
             raise ValueError("指標計算資料不足")
 
@@ -566,6 +574,7 @@ def get_tw_fear_greed():
     except Exception as e:
         print(f"⚠️ 無法計算台股恐懼與貪婪指數: {type(e).__name__}: {e}", file=sys.stderr)
         return fail
+
 
 
 
