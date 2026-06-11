@@ -579,6 +579,105 @@ def get_tw_fear_greed():
 
 
 # =========================
+# 🇺🇸 美國消費者物價指數 CPI（資料來源：FRED / 美國勞工統計局）
+# =========================
+def _fred_series(series_id: str):
+    """從 FRED 取得月度時間序列，回傳 {YYYY-MM: value} 的 dict（免 API key）。"""
+    import io
+    import csv as _csv
+    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+    r = requests.get(url, headers=HEADERS, timeout=30)
+    r.raise_for_status()
+    out = {}
+    rows = list(_csv.reader(io.StringIO(r.text)))
+    for row in rows[1:]:
+        if len(row) < 2:
+            continue
+        date, val = row[0].strip(), row[-1].strip()
+        if val in (".", "", "NA"):
+            continue
+        try:
+            out[date[:7]] = float(val)
+        except ValueError:
+            continue
+    return out
+
+
+def _yoy(series: dict, ym: str):
+    """計算某月（YYYY-MM）相對 12 個月前的年增率 %。"""
+    y, m = ym.split("-")
+    prev_key = f"{int(y) - 1}-{m}"
+    if ym in series and prev_key in series and series[prev_key]:
+        return (series[ym] / series[prev_key] - 1) * 100
+    return None
+
+
+def get_us_cpi():
+    """取得最新一期美國 CPI 年增率（實際值 vs 前值）與核心 CPI、月增率。"""
+    import sys
+    fail = {
+        "ok": False,
+        "month_label": "",
+        "headline_actual": None,
+        "headline_prev": None,
+        "headline_mom": None,
+        "headline_mom_prev": None,
+        "core_actual": None,
+        "core_prev": None,
+        "rising": None,
+        "source": "FRED",
+    }
+    try:
+        head = _fred_series("CPIAUCNS")    # 全項 CPI（未季調，用於年增率）
+        if not head:
+            raise ValueError("無 CPI 資料")
+        months = sorted(head.keys())
+        last_m = months[-1]
+        prev_m = months[-2]
+
+        headline_actual = _yoy(head, last_m)
+        headline_prev = _yoy(head, prev_m)
+        headline_mom = (head[last_m] / head[prev_m] - 1) * 100 if head.get(prev_m) else None
+        prev2_m = months[-3] if len(months) >= 3 else None
+        headline_mom_prev = (
+            (head[prev_m] / head[prev2_m] - 1) * 100
+            if prev2_m and head.get(prev2_m) else None
+        )
+
+        # 核心 CPI（未季調）
+        core_actual = core_prev = None
+        try:
+            core = _fred_series("CPILFENS")
+            if core:
+                core_actual = _yoy(core, last_m)
+                core_prev = _yoy(core, prev_m)
+        except Exception:
+            pass
+
+        y, m = last_m.split("-")
+        rising = (
+            headline_actual is not None and headline_prev is not None
+            and headline_actual > headline_prev
+        )
+
+        return {
+            "ok": True,
+            "month_label": f"{y}年{int(m)}月",
+            "headline_actual": round(headline_actual, 2) if headline_actual is not None else None,
+            "headline_prev": round(headline_prev, 2) if headline_prev is not None else None,
+            "headline_mom": round(headline_mom, 2) if headline_mom is not None else None,
+            "headline_mom_prev": round(headline_mom_prev, 2) if headline_mom_prev is not None else None,
+            "core_actual": round(core_actual, 2) if core_actual is not None else None,
+            "core_prev": round(core_prev, 2) if core_prev is not None else None,
+            "rising": rising,
+            "source": "FRED",
+        }
+    except Exception as e:
+        print(f"⚠️ 無法取得美國 CPI: {type(e).__name__}: {e}", file=sys.stderr)
+        return fail
+
+
+# =========================
 # 🚗 國五：南下 / 北上分開顯示
 # =========================
 def normalize_traffic_status(text: str) -> str:
@@ -887,6 +986,7 @@ def generate_html():
     indices = get_indices()
     fear_greed = get_fear_greed()
     tw_fear_greed = get_tw_fear_greed()
+    us_cpi = get_us_cpi()
     traffic = get_traffic()
     personal_emails = get_personal_emails(limit=3)
     ai_summary = build_ai_summary(stocks)
@@ -911,6 +1011,25 @@ def generate_html():
             f"{tw_fear_greed['taiex_change']} {tw_fear_greed['taiex_pct']:+.2f}%"
         )
     tw_sub = " ｜ ".join(tw_parts) if tw_parts else "0=極度恐懼 100=極度貪婪"
+
+    # 美國 CPI 顯示文字
+    def _pct(v):
+        return f"{v:.2f}%" if isinstance(v, (int, float)) else "--"
+
+    if us_cpi.get("ok"):
+        cpi_title = f"🇺🇸 美國 CPI（{us_cpi['month_label']}）"
+        cpi_arrow = "🔴 較前值上升" if us_cpi.get("rising") else "🟢 較前值回落"
+        cpi_lines = [
+            f"年增率(YoY)：實際 {_pct(us_cpi['headline_actual'])}｜前值 {_pct(us_cpi['headline_prev'])} {cpi_arrow}",
+            f"月增率(MoM)：實際 {_pct(us_cpi['headline_mom'])}｜前值 {_pct(us_cpi['headline_mom_prev'])}",
+        ]
+        if us_cpi.get("core_actual") is not None:
+            cpi_lines.append(
+                f"核心年增率：實際 {_pct(us_cpi['core_actual'])}｜前值 {_pct(us_cpi['core_prev'])}"
+            )
+    else:
+        cpi_title = "🇺🇸 美國 CPI"
+        cpi_lines = ["資料取得中"]
 
     html = f"""<!doctype html>
 <html lang="zh-Hant">
@@ -986,6 +1105,12 @@ body {{ font-family: Arial, "Noto Sans TC", sans-serif; padding: 24px; color: #2
     <span class="twfng-name">{esc_html(tw_fear_greed["emoji"])} {esc_html(tw_fear_greed["name"])}：{esc_html(tw_fear_greed["score"])}（{esc_html(tw_fear_greed["label"])}）</span>
     <span class="twfng-meta small">{esc_html(tw_sub)}</span>
   </div>
+</div>
+
+<div class="card us-cpi">
+  <div class="section-title">{esc_html(cpi_title)}</div>
+  {''.join(f'<div class="cpi-row stock-row"><span class="cpi-line">{esc_html(line)}</span></div>' for line in cpi_lines)}
+  <div class="cpi-row small">來源：{esc_html(us_cpi.get("source", "FRED"))}</div>
 </div>
 
 <div class="card traffic">

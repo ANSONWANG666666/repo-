@@ -54,6 +54,7 @@ def parse_briefing(html_path: Path) -> dict:
         "indices": [],
         "fear_greed": {"name": "", "meta": ""},
         "tw_fear_greed": {"name": "", "meta": ""},
+        "us_cpi": {"title": "", "lines": [], "source": ""},
         "traffic": {
             "south_status": "",
             "north_status": "",
@@ -100,6 +101,17 @@ def parse_briefing(html_path: Path) -> dict:
             "name": _text(twfng_row.select_one(".twfng-name")),
             "meta": _text(twfng_row.select_one(".twfng-meta")),
         }
+
+    cpi_card = soup.select_one(".us-cpi")
+    if cpi_card:
+        title = _text(cpi_card.select_one(".section-title"))
+        lines = [_text(el) for el in cpi_card.select(".cpi-line")]
+        source = ""
+        for row in cpi_card.select(".cpi-row"):
+            txt = _text(row)
+            if txt.startswith("來源："):
+                source = txt.replace("來源：", "").strip()
+        result["us_cpi"] = {"title": title, "lines": lines, "source": source}
 
     south_title = soup.select_one('.traffic .southbound .traffic-title[data-dir="south"]')
     north_title = soup.select_one('.traffic .northbound .traffic-title[data-dir="north"]')
@@ -194,6 +206,15 @@ def build_message(data: dict) -> str:
         lines.append(f"│ {esc(twfng['name'])}")
         if twfng.get("meta"):
             lines.append(f"│ └─ {esc(twfng['meta'])}")
+        lines += ["╰────────────────", ""]
+
+    cpi = data.get("us_cpi", {})
+    if cpi and cpi.get("title") and cpi.get("lines"):
+        lines += [f"╭─ *{esc(cpi['title'])}*"]
+        for ln in cpi["lines"]:
+            lines.append(f"│ 📊 {esc(ln)}")
+        if cpi.get("source"):
+            lines.append(f"│ 來源：{esc(cpi['source'])}")
         lines += ["╰────────────────", ""]
 
     traffic = data.get("traffic", {})
