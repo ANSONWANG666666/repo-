@@ -596,7 +596,13 @@ def _fred_observations(series_id: str, tries: int = 4):
     if series_id in _FRED_CACHE:
         return _FRED_CACHE[series_id]
 
-    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+    # 只抓近 5 年資料（用 cosd 起始日）：避免 T10Y2Y/VIXCLS 等超長日序列
+    # 整包 CSV 過大導致下載逾時；5 年足夠計算年增率與趨勢。
+    from datetime import datetime as _dt
+    cosd = f"{_dt.now().year - 5}-01-01"
+    url = (
+        f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}&cosd={cosd}"
+    )
     last_err = None
     for attempt in range(tries):
         try:
