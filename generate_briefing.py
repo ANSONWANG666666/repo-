@@ -581,26 +581,59 @@ def get_tw_fear_greed():
 # =========================
 # 🇺🇸 美國消費者物價指數 CPI（資料來源：FRED / 美國勞工統計局）
 # =========================
-def _fred_series(series_id: str):
-    """從 FRED 取得月度時間序列，回傳 {YYYY-MM: value} 的 dict（免 API key）。"""
+_FRED_CACHE = {}
+
+
+def _fred_observations(series_id: str, tries: int = 4):
+    """從 FRED 取得完整時間序列，回傳 [(YYYY-MM-DD, value), ...]（升冪、免 API key）。
+
+    含記憶體快取與重試，降低 FRED 偶發逾時造成的失敗。
+    """
     import io
     import csv as _csv
+    import time as _time
+
+    if series_id in _FRED_CACHE:
+        return _FRED_CACHE[series_id]
+
     url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
-    r = requests.get(url, headers=HEADERS, timeout=30)
-    r.raise_for_status()
-    out = {}
-    rows = list(_csv.reader(io.StringIO(r.text)))
-    for row in rows[1:]:
-        if len(row) < 2:
-            continue
-        date, val = row[0].strip(), row[-1].strip()
-        if val in (".", "", "NA"):
-            continue
+    last_err = None
+    for attempt in range(tries):
         try:
-            out[date[:7]] = float(val)
-        except ValueError:
-            continue
+            r = requests.get(url, headers=HEADERS, timeout=40)
+            r.raise_for_status()
+            data = []
+            rows = list(_csv.reader(io.StringIO(r.text)))
+            for row in rows[1:]:
+                if len(row) < 2:
+                    continue
+                date, val = row[0].strip(), row[-1].strip()
+                if val in (".", "", "NA"):
+                    continue
+                try:
+                    data.append((date, float(val)))
+                except ValueError:
+                    continue
+            _FRED_CACHE[series_id] = data
+            return data
+        except Exception as e:
+            last_err = e
+            _time.sleep(2)
+    raise last_err
+
+
+def _fred_series(series_id: str):
+    """回傳 {YYYY-MM: value} 的月度 dict（取每月最後一筆）。"""
+    out = {}
+    for date, val in _fred_observations(series_id):
+        out[date[:7]] = val
     return out
+
+
+def _fred_latest(series_id: str):
+    """回傳最新一筆 (date, value)；無資料則 (None, None)。"""
+    obs = _fred_observations(series_id)
+    return obs[-1] if obs else (None, None)
 
 
 def _yoy(series: dict, ym: str):
@@ -675,6 +708,214 @@ def get_us_cpi():
     except Exception as e:
         print(f"⚠️ 無法取得美國 CPI: {type(e).__name__}: {e}", file=sys.stderr)
         return fail
+
+
+# =========================
+# 🌐 美國景氣風險指標（失業率-CPI + 五大總經風險儀表板）
+# 資料來源：FRED（UNRATE / CPIAUCNS / T10Y2Y / USALOLITOAASTSAM / BAMLH0A0HYM2 / VIXCLS）
+# =========================
+_RISK_COLORS = ["🟢", "🟡", "🟠", "🔴"]
+_RISK_NAMES = ["安全", "注意", "警戒", "高風險"]
+
+
+def _consecutive_declines(values):
+    """從序列尾端往前算連續下降的期數。"""
+    dec = 0
+    for i in range(len(values) - 1, 0, -1):
+        if values[i] < values[i - 1]:
+            dec += 1
+        else:
+            break
+    return dec
+
+
+def get_macro_risk():
+    """計算美國景氣與五大總經風險指標，回傳各指標數值、風險等級與綜合分數。
+
+    每個指標獨立抓取，單一資料源失敗只會讓該指標顯示「暫無資料」，
+    不影響其他指標與整體輸出。
+    """
+    import sys
+    m = {
+        "ok": False,
+        "unrate": None, "cpi_yoy": None, "spread": None, "l1": None,
+        "curve": None, "l2": None,
+        "lei_yoy": None, "lei_dec": None, "l3": None,
+        "hy": None, "l4": None,
+        "vix": None, "l5": None,
+        "total": 0, "max_total": 0, "zone": 0, "n_avail": 0,
+    }
+
+    # 指標1：失業率 − CPI 年增率
+    try:
+        unrate = _fred_latest("UNRATE")[1]
+        cpi = _fred_series("CPIAUCNS")
+        cpi_yoy = _yoy(cpi, sorted(cpi)[-1])
+        if unrate is not None and cpi_yoy is not None:
+            spread = unrate - cpi_yoy
+            m["unrate"], m["cpi_yoy"], m["spread"] = unrate, cpi_yoy, spread
+            if spread > 2:
+                m["l1"] = 0
+            elif spread >= 0.5:
+                m["l1"] = 1
+            elif spread >= 0:
+                m["l1"] = 2
+            else:
+                m["l1"] = 3
+    except Exception as e:
+        print(f"⚠️ 失業率-CPI 取得失敗: {type(e).__name__}: {e}", file=sys.stderr)
+
+    # 指標2：10Y−2Y 殖利率曲線
+    try:
+        curve = _fred_latest("T10Y2Y")[1]
+        if curve is not None:
+            m["curve"] = curve
+            m["l2"] = 0 if curve > 1 else (1 if curve >= 0 else 3)
+    except Exception as e:
+        print(f"⚠️ 10Y-2Y 取得失敗: {type(e).__name__}: {e}", file=sys.stderr)
+
+    # 指標3：領先指標（OECD 美國綜合領先指標 CLI，振幅調整，代理 Conference Board LEI）
+    try:
+        lei_obs = _fred_observations("USALOLITOAASTSAM")
+        if lei_obs:
+            lei_vals = [v for _, v in lei_obs]
+            lei_dict = {d[:7]: v for d, v in lei_obs}
+            lei_yoy = _yoy(lei_dict, sorted(lei_dict)[-1])
+            lei_dec = _consecutive_declines(lei_vals)
+            m["lei_yoy"], m["lei_dec"] = lei_yoy, lei_dec
+            if lei_yoy is not None and lei_yoy < -4:
+                m["l3"] = 3
+            elif lei_dec >= 6:
+                m["l3"] = 2
+            elif lei_dec >= 3:
+                m["l3"] = 1
+            else:
+                m["l3"] = 0
+    except Exception as e:
+        print(f"⚠️ 領先指標取得失敗: {type(e).__name__}: {e}", file=sys.stderr)
+
+    # 指標4：高收益債利差
+    try:
+        hy = _fred_latest("BAMLH0A0HYM2")[1]
+        if hy is not None:
+            m["hy"] = hy
+            m["l4"] = 0 if hy < 4 else (1 if hy < 6 else (2 if hy < 8 else 3))
+    except Exception as e:
+        print(f"⚠️ 高收益債利差取得失敗: {type(e).__name__}: {e}", file=sys.stderr)
+
+    # 指標5：VIX 恐慌指數
+    try:
+        vix = _fred_latest("VIXCLS")[1]
+        if vix is not None:
+            m["vix"] = vix
+            m["l5"] = 0 if vix < 20 else (1 if vix < 30 else (2 if vix < 40 else 3))
+    except Exception as e:
+        print(f"⚠️ VIX 取得失敗: {type(e).__name__}: {e}", file=sys.stderr)
+
+    # 綜合評分（只計可用指標；全部可用時用使用者指定的 0-15 分級）
+    levels = [m[k] for k in ("l1", "l2", "l3", "l4", "l5") if m[k] is not None]
+    n = len(levels)
+    m["n_avail"] = n
+    if n:
+        m["ok"] = True
+        total = sum(levels)
+        m["total"], m["max_total"] = total, 3 * n
+        if n == 5:
+            m["zone"] = 0 if total <= 3 else (1 if total <= 6 else (2 if total <= 10 else 3))
+        else:
+            ratio = total / (3 * n)
+            m["zone"] = 0 if ratio <= 0.2 else (1 if ratio <= 0.4 else (2 if ratio <= 0.67 else 3))
+    return m
+
+
+def build_business_cycle_lines(m):
+    """組裝【失業率－CPI景氣指標】輸出文字。"""
+    if m.get("l1") is None or m.get("spread") is None:
+        return ["資料取得中"]
+    l1, s = m["l1"], m["spread"]
+    hist = {
+        0: "差值偏高，經濟偏冷、通膨受控，聯準會具降息空間，對股市偏正面。",
+        1: "成熟擴張期，開始留意過熱風險，對股市中性偏多。",
+        2: "差值接近0，歷史上常見於景氣循環後段，需提高警覺、留意聯準會轉向。",
+        3: "通膨高於失業率，歷史上曾見於1968/1973/1990/2000/2007/2021等重大修正或衰退前夕，高風險警訊。",
+    }[l1]
+    us = {
+        0: "標普500/NASDAQ/AI股：流動性偏寬，偏多。",
+        1: "標普500/NASDAQ/AI股：中性偏多，留意評價。",
+        2: "標普500/NASDAQ/AI股：審慎，防禦類股相對抗跌。",
+        3: "標普500/NASDAQ/AI股：高波動風險，宜降低部位。",
+    }[l1]
+    tw = {
+        0: "加權/台積電/AI供應鏈：資金行情有利，偏多。",
+        1: "加權/台積電/AI供應鏈：中性偏多，分批操作。",
+        2: "加權/台積電/AI供應鏈：留意外資動向，控管部位。",
+        3: "加權/台積電/AI供應鏈：景氣後段，提高警覺。",
+    }[l1]
+    concl = {
+        0: f"差值{s:.2f}%，高於警戒區，未見高風險訊號，可偏積極。",
+        1: f"差值{s:.2f}%，成熟擴張，中性偏多。",
+        2: f"差值{s:.2f}%，接近警戒區，宜觀望、提高警覺。",
+        3: f"差值{s:.2f}%，已翻負，歷史高風險訊號，宜防守減碼。",
+    }[l1]
+    return [
+        f"最新失業率：{m['unrate']:.1f}%",
+        f"最新CPI年增率：{m['cpi_yoy']:.2f}%",
+        f"差值：{s:.2f}%",
+        f"風險等級：{_RISK_COLORS[l1]} {_RISK_NAMES[l1]}",
+        f"歷史位置：{hist}",
+        f"對美股：{us}",
+        f"對台股：{tw}",
+        f"一句話結論：{concl}",
+    ]
+
+
+def build_risk_dashboard_lines(m):
+    """組裝【全球股市風險儀表板】輸出文字。"""
+    if not m.get("ok"):
+        return ["資料取得中"]
+
+    def row(label, valtext, level):
+        if level is None:
+            return f"{label}：暫無資料 ⚪"
+        return f"{label}：{valtext} {_RISK_COLORS[level]} {_RISK_NAMES[level]}"
+
+    if m["lei_yoy"] is not None:
+        lei_yoy_txt = f"YoY {m['lei_yoy']:+.1f}%"
+        if m["lei_dec"] and m["lei_dec"] >= 3:
+            lei_yoy_txt += f"／連跌{m['lei_dec']}月"
+    else:
+        lei_yoy_txt = "—"
+
+    lines = [
+        row("失業率-CPI", f"{m['spread']:.2f}%" if m["spread"] is not None else "—", m["l1"]),
+        row("10Y-2Y利差", f"{m['curve']:.2f}%" if m["curve"] is not None else "—", m["l2"]),
+        row("領先指標(OECD CLI)", lei_yoy_txt, m["l3"]),
+        row("高收益債利差", f"{m['hy']:.2f}%" if m["hy"] is not None else "—", m["l4"]),
+        row("VIX恐慌指數", f"{m['vix']:.1f}" if m["vix"] is not None else "—", m["l5"]),
+    ]
+    zone = m["zone"]
+    zone_name = ["牛市區", "正常區", "警戒區", "高風險區"][zone]
+    avail_note = "" if m["n_avail"] == 5 else f"（{m['n_avail']}/5項）"
+    lines.append(
+        f"風險分數：{m['total']}/{m['max_total']}{avail_note}　燈號：{_RISK_COLORS[zone]} {zone_name}"
+    )
+    us = {
+        0: "美股：SP500/NASDAQ/費半/AI偏多，可進攻。",
+        1: "美股：SP500/NASDAQ/費半/AI中性偏多。",
+        2: "美股：SP500/NASDAQ/費半/AI審慎，留意回檔。",
+        3: "美股：SP500/NASDAQ/費半/AI高風險，宜防守。",
+    }[zone]
+    tw = {
+        0: "台股：加權/台積電/AI供應鏈/高股息ETF偏多。",
+        1: "台股：加權/台積電/AI供應鏈中性偏多，高股息ETF防禦。",
+        2: "台股：加權審慎，側重高股息ETF防禦。",
+        3: "台股：加權高風險，提高現金、側重高股息ETF。",
+    }[zone]
+    concl = {0: "進攻", 1: "正常持股", 2: "觀望", 3: "防守減碼"}[zone]
+    lines.append(us)
+    lines.append(tw)
+    lines.append(f"一句話結論：風險分數{m['total']}/{m['max_total']}，建議「{concl}」。")
+    return lines
 
 
 # =========================
@@ -987,6 +1228,9 @@ def generate_html():
     fear_greed = get_fear_greed()
     tw_fear_greed = get_tw_fear_greed()
     us_cpi = get_us_cpi()
+    macro_risk = get_macro_risk()
+    bc_lines = build_business_cycle_lines(macro_risk)
+    rd_lines = build_risk_dashboard_lines(macro_risk)
     traffic = get_traffic()
     personal_emails = get_personal_emails(limit=3)
     ai_summary = build_ai_summary(stocks)
@@ -1111,6 +1355,16 @@ body {{ font-family: Arial, "Noto Sans TC", sans-serif; padding: 24px; color: #2
   <div class="section-title">{esc_html(cpi_title)}</div>
   {''.join(f'<div class="cpi-row stock-row"><span class="cpi-line">{esc_html(line)}</span></div>' for line in cpi_lines)}
   <div class="cpi-row small">來源：{esc_html(us_cpi.get("source", "FRED"))}</div>
+</div>
+
+<div class="card biz-cycle">
+  <div class="section-title">📉 失業率－CPI景氣指標</div>
+  {''.join(f'<div class="bc-row stock-row"><span class="bc-line">{esc_html(line)}</span></div>' for line in bc_lines)}
+</div>
+
+<div class="card risk-dashboard">
+  <div class="section-title">🌐 全球股市風險儀表板</div>
+  {''.join(f'<div class="rd-row stock-row"><span class="rd-line">{esc_html(line)}</span></div>' for line in rd_lines)}
 </div>
 
 <div class="card traffic">

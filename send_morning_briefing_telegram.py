@@ -55,6 +55,8 @@ def parse_briefing(html_path: Path) -> dict:
         "fear_greed": {"name": "", "meta": ""},
         "tw_fear_greed": {"name": "", "meta": ""},
         "us_cpi": {"title": "", "lines": [], "source": ""},
+        "biz_cycle": [],
+        "risk_dashboard": [],
         "traffic": {
             "south_status": "",
             "north_status": "",
@@ -112,6 +114,14 @@ def parse_briefing(html_path: Path) -> dict:
             if txt.startswith("來源："):
                 source = txt.replace("來源：", "").strip()
         result["us_cpi"] = {"title": title, "lines": lines, "source": source}
+
+    bc_card = soup.select_one(".biz-cycle")
+    if bc_card:
+        result["biz_cycle"] = [_text(el) for el in bc_card.select(".bc-line")]
+
+    rd_card = soup.select_one(".risk-dashboard")
+    if rd_card:
+        result["risk_dashboard"] = [_text(el) for el in rd_card.select(".rd-line")]
 
     south_title = soup.select_one('.traffic .southbound .traffic-title[data-dir="south"]')
     north_title = soup.select_one('.traffic .northbound .traffic-title[data-dir="north"]')
@@ -217,6 +227,20 @@ def build_message(data: dict) -> str:
             lines.append(f"│ 來源：{esc(cpi['source'])}")
         lines += ["╰────────────────", ""]
 
+    bc = data.get("biz_cycle", [])
+    if bc:
+        lines += ["╭─ 📉 *失業率－CPI景氣指標*"]
+        for ln in bc:
+            lines.append(f"│ {esc(ln)}")
+        lines += ["╰────────────────", ""]
+
+    rd = data.get("risk_dashboard", [])
+    if rd:
+        lines += ["╭─ 🌐 *全球股市風險儀表板*"]
+        for ln in rd:
+            lines.append(f"│ {esc(ln)}")
+        lines += ["╰────────────────", ""]
+
     traffic = data.get("traffic", {})
     if traffic:
         lines += [
@@ -274,23 +298,43 @@ def build_message(data: dict) -> str:
     return "\n".join(lines)
 
 
+def split_message(text: str, limit: int = 3800):
+    """將訊息依空白行（區塊）切成多段，每段不超過 limit 字元（Telegram 上限 4096）。"""
+    if len(text) <= limit:
+        return [text]
+    parts = []
+    cur = ""
+    for block in text.split("\n\n"):
+        candidate = block if not cur else cur + "\n\n" + block
+        if len(candidate) > limit and cur:
+            parts.append(cur)
+            cur = block
+        else:
+            cur = candidate
+    if cur:
+        parts.append(cur)
+    return parts
+
+
 def send_telegram(message: str):
     if not BOT_TOKEN or not CHAT_ID:
         raise ValueError("❌ BOT_TOKEN 或 CHAT_ID 未設定")
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    resp = requests.post(
-        url,
-        json={
-            "chat_id": CHAT_ID,
-            "text": message,
-            "parse_mode": "MarkdownV2",
-            "disable_web_page_preview": True,
-        },
-        timeout=20
-    )
-    resp.raise_for_status()
-    print("✅ Telegram 發送成功")
+    parts = split_message(message)
+    for idx, part in enumerate(parts, 1):
+        resp = requests.post(
+            url,
+            json={
+                "chat_id": CHAT_ID,
+                "text": part,
+                "parse_mode": "MarkdownV2",
+                "disable_web_page_preview": True,
+            },
+            timeout=20
+        )
+        resp.raise_for_status()
+        print(f"✅ Telegram 發送成功（{idx}/{len(parts)}）")
 
 
 def main():
