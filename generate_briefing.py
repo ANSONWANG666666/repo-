@@ -925,6 +925,126 @@ def build_risk_dashboard_lines(m):
 
 
 # =========================
+# 🎯 即將出關處置股（主力/三大法人買超）— TWSE 官方資料
+# =========================
+# 「即將出關」定義：最後一筆處置迄日落在今日起算 N 天內
+DISPOSITION_RELEASE_WINDOW_DAYS = 3
+
+
+def _roc_to_date(s: str):
+    """民國日期字串（如 115/06/26）轉成西元 date。"""
+    from datetime import date as _date
+    parts = (s or "").strip().split("/")
+    if len(parts) != 3:
+        return None
+    try:
+        return _date(int(parts[0]) + 1911, int(parts[1]), int(parts[2]))
+    except Exception:
+        return None
+
+
+def _get_latest_t86():
+    """取最近一個交易日的三大法人買賣超，回傳 ({code: 淨買賣超股數}, 日期字串)。"""
+    from datetime import datetime as _dt, timedelta as _td
+    today = _dt.now().date()
+    for i in range(7):
+        ymd = (today - _td(days=i)).strftime("%Y%m%d")
+        url = (
+            f"https://www.twse.com.tw/rwd/zh/fund/T86"
+            f"?date={ymd}&selectType=ALL&response=json"
+        )
+        try:
+            j = fetch_json(url, timeout=25)
+            if j.get("stat") == "OK" and j.get("data"):
+                out = {}
+                for r in j["data"]:
+                    code = (r[0] or "").strip()
+                    out[code] = to_float(r[-1], 0.0)  # 末欄＝三大法人買賣超股數
+                return out, f"{ymd[4:6]}/{ymd[6:8]}"
+        except Exception:
+            continue
+    return {}, ""
+
+
+def get_disposition_watch():
+    """即將出關且主力（三大法人）買超的上市處置股。"""
+    import sys
+    from datetime import datetime as _dt
+    try:
+        punish = fetch_json(
+            "https://openapi.twse.com.tw/v1/announcement/punish", timeout=25
+        )
+    except Exception as e:
+        print(f"⚠️ 無法取得處置股清單: {type(e).__name__}: {e}", file=sys.stderr)
+        return {"ok": False, "items": [], "note": "資料取得中"}
+
+    today = _dt.now().date()
+    # 同一檔可能有多筆處置公告，取最晚迄日（真正出關日）
+    ends = {}
+    for row in punish:
+        code = (row.get("Code") or "").strip()
+        if not (len(code) == 4 and code.isdigit()):  # 僅上市股票，排除權證
+            continue
+        period = row.get("DispositionPeriod", "")
+        end_s = re.split(r"[～~]", period)[-1].strip() if period else ""
+        end_d = _roc_to_date(end_s)
+        if not end_d:
+            continue
+        name = (row.get("Name") or "").strip()
+        if code not in ends or end_d > ends[code][1]:
+            ends[code] = (name, end_d)
+
+    upcoming = []
+    for code, (name, end_d) in ends.items():
+        days = (end_d - today).days
+        if 0 <= days <= DISPOSITION_RELEASE_WINDOW_DAYS:
+            upcoming.append({"code": code, "name": name, "end": end_d, "days": days})
+
+    if not upcoming:
+        return {"ok": True, "items": [], "note": "今日無即將出關的處置股"}
+
+    t86, t86_date = _get_latest_t86()
+    if not t86:
+        return {
+            "ok": True, "items": [], "upcoming_count": len(upcoming),
+            "note": "即將出關 %d 檔，惟主力(法人)資料暫缺" % len(upcoming),
+        }
+
+    items = []
+    for u in upcoming:
+        net = t86.get(u["code"])
+        if net is not None and net > 0:  # 主力(法人)買大於賣
+            u["net_lots"] = net / 1000.0
+            items.append(u)
+    items.sort(key=lambda x: (x["days"], -x["net_lots"]))
+
+    return {
+        "ok": True,
+        "items": items[:8],
+        "upcoming_count": len(upcoming),
+        "t86_date": t86_date,
+    }
+
+
+def build_disposition_lines(d):
+    """組裝【即將出關處置股】輸出文字。"""
+    if not d.get("ok"):
+        return ["資料取得中"]
+    items = d.get("items", [])
+    if not items:
+        return [d.get("note", "今日無即將出關的處置股")]
+    lines = []
+    for it in items:
+        mmdd = it["end"].strftime("%m/%d")
+        lines.append(
+            f"{it['code']} {it['name']}：處置至 {mmdd}｜主力(法人)買超 +{it['net_lots']:,.0f}張"
+        )
+    if d.get("t86_date"):
+        lines.append(f"（法人資料：{d['t86_date']}；隔日為出關首日）")
+    return lines
+
+
+# =========================
 # 🚗 國五：南下 / 北上分開顯示
 # =========================
 def normalize_traffic_status(text: str) -> str:
@@ -1237,6 +1357,8 @@ def generate_html():
     macro_risk = get_macro_risk()
     bc_lines = build_business_cycle_lines(macro_risk)
     rd_lines = build_risk_dashboard_lines(macro_risk)
+    disposition = get_disposition_watch()
+    disp_lines = build_disposition_lines(disposition)
     traffic = get_traffic()
     personal_emails = get_personal_emails(limit=3)
     ai_summary = build_ai_summary(stocks)
@@ -1371,6 +1493,11 @@ body {{ font-family: Arial, "Noto Sans TC", sans-serif; padding: 24px; color: #2
 <div class="card risk-dashboard">
   <div class="section-title">🌐 全球股市風險儀表板</div>
   {''.join(f'<div class="rd-row stock-row"><span class="rd-line">{esc_html(line)}</span></div>' for line in rd_lines)}
+</div>
+
+<div class="card disposition">
+  <div class="section-title">🎯 即將出關處置股（主力買超）</div>
+  {''.join(f'<div class="disp-row stock-row"><span class="disp-line">{esc_html(line)}</span></div>' for line in disp_lines)}
 </div>
 
 <div class="card traffic">

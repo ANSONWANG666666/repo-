@@ -57,6 +57,7 @@ def parse_briefing(html_path: Path) -> dict:
         "us_cpi": {"title": "", "lines": [], "source": ""},
         "biz_cycle": [],
         "risk_dashboard": [],
+        "disposition": [],
         "traffic": {
             "south_status": "",
             "north_status": "",
@@ -122,6 +123,10 @@ def parse_briefing(html_path: Path) -> dict:
     rd_card = soup.select_one(".risk-dashboard")
     if rd_card:
         result["risk_dashboard"] = [_text(el) for el in rd_card.select(".rd-line")]
+
+    disp_card = soup.select_one(".disposition")
+    if disp_card:
+        result["disposition"] = [_text(el) for el in disp_card.select(".disp-line")]
 
     south_title = soup.select_one('.traffic .southbound .traffic-title[data-dir="south"]')
     north_title = soup.select_one('.traffic .northbound .traffic-title[data-dir="north"]')
@@ -238,6 +243,13 @@ def build_message(data: dict) -> str:
     if rd:
         lines += ["╭─ 🌐 *全球股市風險儀表板*"]
         for ln in rd:
+            lines.append(f"│ {esc(ln)}")
+        lines += ["╰────────────────", ""]
+
+    disp = data.get("disposition", [])
+    if disp:
+        lines += ["╭─ 🎯 *即將出關處置股（主力買超）*"]
+        for ln in disp:
             lines.append(f"│ {esc(ln)}")
         lines += ["╰────────────────", ""]
 
