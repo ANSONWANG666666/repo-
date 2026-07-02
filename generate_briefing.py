@@ -717,6 +717,122 @@ def get_us_cpi():
 
 
 # =========================
+# 🏦 美國 Fed 利率決策 / PCE / 非農就業與失業率 / 10年期公債
+# 資料來源：FRED（DFEDTARU/DFEDTARL / PCEPI/PCEPILFE / PAYEMS/UNRATE / DGS10）
+# =========================
+def _fred_last_change(obs):
+    """在 (日期, 值) 序列中找最後一次數值變動，回傳 (現值, 前值, 變動日 YYYY-MM-DD)。"""
+    if not obs:
+        return None, None, None
+    cur = obs[-1][1]
+    for i in range(len(obs) - 1, 0, -1):
+        if obs[i][1] != cur:
+            return cur, obs[i][1], obs[i + 1][0]
+    return cur, cur, obs[0][0]
+
+
+def get_us_econ():
+    """取得 Fed 利率決策、PCE、非農就業與失業率、10年期公債殖利率。
+
+    每項獨立抓取，單一失敗只略過該項，不影響其他項與整體輸出。
+    """
+    import sys
+    e = {"ok": False}
+
+    # Fed 目標利率區間 + 最近一次決策
+    try:
+        up = _fred_observations("DFEDTARU")
+        lo = _fred_observations("DFEDTARL")
+        if up and lo:
+            e["fed_upper"] = up[-1][1]
+            e["fed_lower"] = lo[-1][1]
+            _, prev_up, chg_date = _fred_last_change(up)
+            e["fed_prev_upper"] = prev_up
+            e["fed_change_date"] = chg_date
+            e["fed_delta_yards"] = round((up[-1][1] - prev_up) / 0.25) if prev_up is not None else 0
+    except Exception as ex:
+        print(f"⚠️ Fed利率取得失敗: {type(ex).__name__}: {ex}", file=sys.stderr)
+
+    # PCE 年增率（總項 + 核心）
+    try:
+        pce = {d[:7]: v for d, v in _fred_observations("PCEPI")}
+        pm = sorted(pce)
+        e["pce_actual"], e["pce_prev"] = _yoy(pce, pm[-1]), _yoy(pce, pm[-2])
+        e["pce_month"] = pm[-1]
+    except Exception as ex:
+        print(f"⚠️ PCE取得失敗: {type(ex).__name__}: {ex}", file=sys.stderr)
+    try:
+        cpce = {d[:7]: v for d, v in _fred_observations("PCEPILFE")}
+        cm = sorted(cpce)
+        e["core_pce_actual"], e["core_pce_prev"] = _yoy(cpce, cm[-1]), _yoy(cpce, cm[-2])
+    except Exception as ex:
+        print(f"⚠️ 核心PCE取得失敗: {type(ex).__name__}: {ex}", file=sys.stderr)
+
+    # 非農就業（月增，千人）
+    try:
+        pay = _fred_observations("PAYEMS")
+        if len(pay) >= 3:
+            e["nfp_actual"] = pay[-1][1] - pay[-2][1]
+            e["nfp_prev"] = pay[-2][1] - pay[-3][1]
+            e["nfp_month"] = pay[-1][0][:7]
+    except Exception as ex:
+        print(f"⚠️ 非農就業取得失敗: {type(ex).__name__}: {ex}", file=sys.stderr)
+
+    # 失業率
+    try:
+        ur = _fred_observations("UNRATE")
+        if len(ur) >= 2:
+            e["ur_actual"], e["ur_prev"] = ur[-1][1], ur[-2][1]
+    except Exception as ex:
+        print(f"⚠️ 失業率取得失敗: {type(ex).__name__}: {ex}", file=sys.stderr)
+
+    # 10 年期公債殖利率
+    try:
+        t10 = _fred_observations("DGS10")
+        if len(t10) >= 2:
+            e["t10"], e["t10_prev"] = t10[-1][1], t10[-2][1]
+            e["t10_chg_bp"] = (t10[-1][1] - t10[-2][1]) * 100
+    except Exception as ex:
+        print(f"⚠️ 10年期公債取得失敗: {type(ex).__name__}: {ex}", file=sys.stderr)
+
+    e["ok"] = any(k in e for k in ("fed_upper", "pce_actual", "nfp_actual", "ur_actual", "t10"))
+    return e
+
+
+def build_us_econ_lines(e):
+    """組裝【美國 Fed 與經濟數據】輸出文字。"""
+    if not e.get("ok"):
+        return ["資料取得中"]
+    lines = []
+
+    if e.get("fed_upper") is not None:
+        chg = ""
+        yards = e.get("fed_delta_yards", 0)
+        if e.get("fed_prev_upper") is not None and yards:
+            arrow = "↓" if yards < 0 else "↑"
+            pu = e["fed_prev_upper"]
+            d = e.get("fed_change_date", "")
+            dstr = f"{d[5:7]}/{d[8:10]}" if len(d) >= 10 else d
+            chg = f"（前次{pu - 0.25:.2f}%~{pu:.2f}%，{arrow}{abs(yards)}碼 {dstr}）"
+        lines.append(f"Fed利率目標：{e['fed_lower']:.2f}%~{e['fed_upper']:.2f}%{chg}")
+
+    if e.get("pce_actual") is not None and e.get("pce_prev") is not None:
+        lines.append(f"PCE年增率：實際 {e['pce_actual']:.2f}%｜前值 {e['pce_prev']:.2f}%")
+    if e.get("core_pce_actual") is not None and e.get("core_pce_prev") is not None:
+        lines.append(f"核心PCE年增率：實際 {e['core_pce_actual']:.2f}%｜前值 {e['core_pce_prev']:.2f}%")
+
+    if e.get("nfp_actual") is not None:
+        lines.append(f"非農就業(新增)：實際 {e['nfp_actual']:+,.0f}千人｜前值 {e['nfp_prev']:+,.0f}千人")
+    if e.get("ur_actual") is not None:
+        lines.append(f"失業率：實際 {e['ur_actual']:.1f}%｜前值 {e['ur_prev']:.1f}%")
+
+    if e.get("t10") is not None:
+        lines.append(f"10年期公債殖利率：{e['t10']:.2f}%（較前日 {e['t10_chg_bp']:+.1f}bp）")
+
+    return lines if lines else ["資料取得中"]
+
+
+# =========================
 # 🌐 美國景氣風險指標（失業率-CPI + 五大總經風險儀表板）
 # 資料來源：FRED（UNRATE / CPIAUCNS / T10Y2Y / USALOLITOAASTSAM / BAMLH0A0HYM2 / VIXCLS）
 # =========================
@@ -1354,6 +1470,8 @@ def generate_html():
     fear_greed = get_fear_greed()
     tw_fear_greed = get_tw_fear_greed()
     us_cpi = get_us_cpi()
+    us_econ = get_us_econ()
+    econ_lines = build_us_econ_lines(us_econ)
     macro_risk = get_macro_risk()
     bc_lines = build_business_cycle_lines(macro_risk)
     rd_lines = build_risk_dashboard_lines(macro_risk)
@@ -1483,6 +1601,12 @@ body {{ font-family: Arial, "Noto Sans TC", sans-serif; padding: 24px; color: #2
   <div class="section-title">{esc_html(cpi_title)}</div>
   {''.join(f'<div class="cpi-row stock-row"><span class="cpi-line">{esc_html(line)}</span></div>' for line in cpi_lines)}
   <div class="cpi-row small">來源：{esc_html(us_cpi.get("source", "FRED"))}</div>
+</div>
+
+<div class="card us-econ">
+  <div class="section-title">🏦 美國Fed與經濟數據</div>
+  {''.join(f'<div class="econ-row stock-row"><span class="econ-line">{esc_html(line)}</span></div>' for line in econ_lines)}
+  <div class="econ-row small">來源：FRED</div>
 </div>
 
 <div class="card biz-cycle">

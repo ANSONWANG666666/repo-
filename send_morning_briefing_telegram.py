@@ -55,6 +55,7 @@ def parse_briefing(html_path: Path) -> dict:
         "fear_greed": {"name": "", "meta": ""},
         "tw_fear_greed": {"name": "", "meta": ""},
         "us_cpi": {"title": "", "lines": [], "source": ""},
+        "us_econ": [],
         "biz_cycle": [],
         "risk_dashboard": [],
         "disposition": [],
@@ -115,6 +116,10 @@ def parse_briefing(html_path: Path) -> dict:
             if txt.startswith("來源："):
                 source = txt.replace("來源：", "").strip()
         result["us_cpi"] = {"title": title, "lines": lines, "source": source}
+
+    econ_card = soup.select_one(".us-econ")
+    if econ_card:
+        result["us_econ"] = [_text(el) for el in econ_card.select(".econ-line")]
 
     bc_card = soup.select_one(".biz-cycle")
     if bc_card:
@@ -230,6 +235,13 @@ def build_message(data: dict) -> str:
             lines.append(f"│ 📊 {esc(ln)}")
         if cpi.get("source"):
             lines.append(f"│ 來源：{esc(cpi['source'])}")
+        lines += ["╰────────────────", ""]
+
+    econ = data.get("us_econ", [])
+    if econ:
+        lines += ["╭─ 🏦 *美國Fed與經濟數據*"]
+        for ln in econ:
+            lines.append(f"│ {esc(ln)}")
         lines += ["╰────────────────", ""]
 
     bc = data.get("biz_cycle", [])
