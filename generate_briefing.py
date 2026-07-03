@@ -412,6 +412,75 @@ def analyze_stock_with_twse(code: str, name: str, price_row: dict, val_row: dict
     }
 
 
+def _get_trend_map(code_suffix: dict):
+    """以 yfinance 批量抓近 3 個月日 K，計算每檔多日趨勢指標。
+
+    回傳 {code: {above_ma20, ma20_rising, up_days, ret20}}；失敗的檔略過。
+    """
+    import yfinance as yf
+    out = {}
+    if not code_suffix:
+        return out
+    tickers = [f"{c}{sfx}" for c, sfx in code_suffix.items()]
+    df = yf.download(
+        " ".join(tickers), period="3mo", interval="1d",
+        progress=False, auto_adjust=False, group_by="ticker", threads=True,
+    )
+    for c, sfx in code_suffix.items():
+        t = f"{c}{sfx}"
+        try:
+            closes = df[t]["Close"].dropna()
+            if len(closes) < 21:
+                continue
+            ma20 = closes.rolling(20).mean()
+            up_days = 0
+            for i in range(len(closes) - 1, 0, -1):
+                if closes.iloc[i] > closes.iloc[i - 1]:
+                    up_days += 1
+                else:
+                    break
+            out[c] = {
+                "above_ma20": bool(closes.iloc[-1] > ma20.iloc[-1]),
+                "ma20_rising": bool(ma20.iloc[-1] > ma20.iloc[-6]),
+                "up_days": up_days,
+                "ret20": float((closes.iloc[-1] / closes.iloc[-21] - 1) * 100),
+            }
+        except Exception:
+            continue
+    return out
+
+
+def _apply_trend(row, tr):
+    """把多日趨勢納入訊號與勝率。
+
+    - 紅燈(強勢股)需站上月線(MA20)確認，否則降為🟡轉折點
+    - 勝率依月線位置/月線方向/連漲天數加減分
+    - 產出趨勢說明文字附在明細列
+    """
+    if not tr:
+        return row
+    above, rising = tr["above_ma20"], tr["ma20_rising"]
+
+    score = row["win_rate"]
+    score += 5 if above else -5
+    score += 3 if rising else -3
+    if tr["up_days"] >= 3:
+        score += 3
+    row["win_rate"] = int(clamp(round(score), 35, 92))
+
+    if row["signal"] == "強勢股" and not above:
+        row["signal"] = "轉折點"
+        row["emoji"] = "🟡"
+        row["reason"] = "動能強但未站上月線"
+
+    parts = [f"月線{'上' if above else '下'}({'升' if rising else '降'})"]
+    if tr["up_days"] >= 2:
+        parts.append(f"連漲{tr['up_days']}日")
+    parts.append(f"20日{tr['ret20']:+.1f}%")
+    row["trend"] = "／".join(parts)
+    return row
+
+
 def get_stocks():
     import sys
     try:
@@ -431,6 +500,17 @@ def get_stocks():
                 tpex_val = fetch_tpex_valuation_index()
             except Exception as e:
                 print(f"⚠️ TPEx 上櫃資料取得失敗: {type(e).__name__}", file=sys.stderr)
+
+        # 多日趨勢（yfinance 批量日 K；上市 .TW／上櫃 .TWO）
+        trend_map = {}
+        try:
+            code_suffix = {
+                s["code"]: (".TWO" if s["code"] not in price_index and s["code"] in tpex_price else ".TW")
+                for s in STOCKS
+            }
+            trend_map = _get_trend_map(code_suffix)
+        except Exception as e:
+            print(f"⚠️ 趨勢資料取得失敗（僅用當日訊號）: {type(e).__name__}", file=sys.stderr)
 
         result = []
         for s in STOCKS:
@@ -456,6 +536,7 @@ def get_stocks():
                 }
             else:
                 row = analyze_stock_with_twse(code, name, price_row, val_row)
+                row = _apply_trend(row, trend_map.get(code))
 
             row["industry"] = s.get("industry", "")
             row["position"] = s.get("position", "")
@@ -1598,7 +1679,7 @@ def build_ai_summary(stocks):
         "group": group,
         "action": action,
         "focus": f"最高分：{top['name']} {top['win_rate']}分",
-        "note": "勝率為官方日資料快照模型分數，非保證報酬。",
+        "note": "勝率＝當日量價＋20日趨勢模型分數，非保證報酬。",
     }
 
 
@@ -1664,7 +1745,7 @@ def generate_html():
             f'''
       <div class="task-item stock-row">
         <span class="task-name">{esc_html(s["emoji"])} {esc_html(s["name"])}{pos} {s["change_pct"]:+.2f}%｜{esc_html(s["signal"])}｜勝率{s["win_rate"]}%</span>
-        <span class="task-meta small">{esc_html(s["reason"])} / PER {esc_html(s["pe"])} / PB {esc_html(s["pb"])} / 殖利率 {esc_html(s["yield"])}%</span>
+        <span class="task-meta small">{esc_html(s["reason"])} / PER {esc_html(s["pe"])} / PB {esc_html(s["pb"])} / 殖利率 {esc_html(s["yield"])}%{(" / " + esc_html(s["trend"])) if s.get("trend") else ""}</span>
       </div>
       '''
         )
