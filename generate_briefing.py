@@ -18,10 +18,71 @@ HEADERS = {
     "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
 }
 
+# AI 供應鏈觀察清單（依產業分組；上市/上櫃自動判別資料源）
+STOCK_GROUPS = [
+    ("AI 晶圓代工", [
+        ("台積電", "2330", "🥇龍頭"),
+        ("聯電", "2303", "第二梯隊"),
+        ("世界先進", "5347", "第三梯隊"),
+    ]),
+    ("AI ASIC／IC設計", [
+        ("世芯-KY", "3661", "🥇ASIC龍頭"),
+        ("創意", "3443", "ASIC"),
+        ("智原", "3035", "ASIC"),
+        ("聯發科", "2454", "AI SoC"),
+    ]),
+    ("AI 封裝／測試", [
+        ("日月光投控", "3711", "先進封裝"),
+        ("京元電子", "2449", "AI晶片測試"),
+    ]),
+    ("AI 伺服器／ODM", [
+        ("廣達", "2382", "🥇伺服器"),
+        ("緯穎", "6669", "🥈伺服器"),
+        ("鴻海", "2317", "AI伺服器／機器人"),
+    ]),
+    ("AI 機殼", [
+        ("勤誠", "8210", "機殼龍頭"),
+    ]),
+    ("AI 散熱", [
+        ("奇鋐", "3017", "🥇散熱龍頭"),
+        ("雙鴻", "3324", "散熱"),
+        ("建準", "2421", "散熱風扇"),
+    ]),
+    ("AI PCB／CCL／ABF載板", [
+        ("台光電", "2383", "高速CCL"),
+        ("金像電", "2368", "AI PCB"),
+        ("欣興", "3037", "PCB／ABF"),
+        ("南電", "8046", "ABF載板"),
+        ("景碩", "3189", "IC載板"),
+    ]),
+    ("AI 光通訊／CPO", [
+        ("上詮", "3363", "CPO"),
+        ("光聖", "6442", "光模組"),
+        ("聯鈞", "3450", "光通訊"),
+    ]),
+    ("AI 網通／交換器", [
+        ("智邦", "2345", "🥇交換器"),
+        ("啟碁", "6285", "網通"),
+        ("中磊", "5388", "網通"),
+    ]),
+    ("AI 電源／BBU", [
+        ("台達電", "2308", "電源龍頭"),
+        ("群電", "6412", "電源"),
+        ("光寶科", "2301", "電源"),
+        ("AES-KY", "6781", "BBU備援電池"),
+        ("順達", "3211", "BBU／電池"),
+    ]),
+    ("AI 機器人／自動化", [
+        ("上銀", "2049", "精密傳動"),
+        ("所羅門", "2359", "AI視覺／機器人"),
+        ("盟立", "2464", "自動化設備"),
+    ]),
+]
+
 STOCKS = [
-    {"name": "台積電", "code": "2330"},
-    {"name": "聯發科", "code": "2454"},
-    {"name": "廣達", "code": "2382"},
+    {"name": n, "code": c, "industry": g, "position": p}
+    for g, items in STOCK_GROUPS
+    for n, c, p in items
 ]
 
 INDICES = [
@@ -183,6 +244,75 @@ def get_all_news():
 # =========================
 # 📈 股票：TWSE 官方 OpenAPI
 # =========================
+def fetch_tpex_price_index():
+    """上櫃每日收盤行情（TPEx OpenAPI），轉成 TWSE 相容欄位的 {code: row}。
+
+    TPEx 憑證缺 Subject Key Identifier，新版 Python 驗證會失敗，
+    對公開行情資料改用 verify=False 並加重試。
+    """
+    import time as _time
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    url = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
+    last_err = None
+    for _ in range(3):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=40, verify=False)
+            r.raise_for_status()
+            out = {}
+            for row in r.json():
+                code = (row.get("SecuritiesCompanyCode") or "").strip()
+                if not code:
+                    continue
+                out[code] = {
+                    "ClosingPrice": row.get("Close", ""),
+                    "OpeningPrice": row.get("Open", ""),
+                    "HighestPrice": row.get("High", ""),
+                    "LowestPrice": row.get("Low", ""),
+                    "Change": row.get("Change", ""),  # 已含正負號
+                    "TradeVolume": row.get("TradingShares", ""),
+                }
+            return out
+        except Exception as e:
+            last_err = e
+            _time.sleep(3)
+    raise last_err
+
+
+def fetch_tpex_valuation_index():
+    """上櫃個股本益比/殖利率/股價淨值比，轉成 TWSE 相容欄位的 {code: row}（best-effort）。"""
+    import time as _time
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    url = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis"
+    for _ in range(3):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=40, verify=False)
+            r.raise_for_status()
+            out = {}
+            for row in r.json():
+                code = (row.get("SecuritiesCompanyCode") or "").strip()
+                if not code:
+                    continue
+                out[code] = {
+                    "PEratio": first_non_empty(
+                        row, ["PriceEarningRatio", "PERatio", "本益比"], "0"
+                    ),
+                    "PBratio": first_non_empty(
+                        row, ["PriceBookRatio", "PBRatio", "股價淨值比"], "0"
+                    ),
+                    "DividendYield": first_non_empty(
+                        row, ["YieldRatio", "DividendYield", "殖利率(%)"], "0"
+                    ),
+                }
+            return out
+        except Exception:
+            _time.sleep(3)
+    return {}
+
+
 def fetch_twse_stock_day_all():
     return fetch_json("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", timeout=25)
 
@@ -283,6 +413,7 @@ def analyze_stock_with_twse(code: str, name: str, price_row: dict, val_row: dict
 
 
 def get_stocks():
+    import sys
     try:
         price_rows = fetch_twse_stock_day_all()
         val_rows = fetch_twse_bwibbu_all()
@@ -290,31 +421,45 @@ def get_stocks():
         price_index = build_index_by_code(price_rows)
         val_index = build_index_by_code(val_rows)
 
+        # 上櫃股票補充資料源（清單中若有上市查不到的代號才需要）
+        tpex_price = {}
+        tpex_val = {}
+        missing = [s["code"] for s in STOCKS if s["code"] not in price_index]
+        if missing:
+            try:
+                tpex_price = fetch_tpex_price_index()
+                tpex_val = fetch_tpex_valuation_index()
+            except Exception as e:
+                print(f"⚠️ TPEx 上櫃資料取得失敗: {type(e).__name__}", file=sys.stderr)
+
         result = []
         for s in STOCKS:
             code = s["code"]
             name = s["name"]
-            price_row = price_index.get(code, {})
-            val_row = val_index.get(code, {})
+            price_row = price_index.get(code) or tpex_price.get(code) or {}
+            val_row = val_index.get(code) or tpex_val.get(code) or {}
 
             if not price_row:
-                result.append({
+                row = {
                     "code": code,
                     "name": name,
                     "price": "--",
                     "change_pct": 0.0,
                     "signal": "資料取得中",
-                    "reason": "TWSE無當日資料",
+                    "reason": "無當日資料",
                     "win_rate": 50,
                     "emoji": "⚪",
                     "volume": 0,
                     "pe": 0,
                     "pb": 0,
                     "yield": 0,
-                })
-                continue
+                }
+            else:
+                row = analyze_stock_with_twse(code, name, price_row, val_row)
 
-            result.append(analyze_stock_with_twse(code, name, price_row, val_row))
+            row["industry"] = s.get("industry", "")
+            row["position"] = s.get("position", "")
+            result.append(row)
 
         return result
 
@@ -322,6 +467,8 @@ def get_stocks():
         return [{
             "code": s["code"],
             "name": s["name"],
+            "industry": s.get("industry", ""),
+            "position": s.get("position", ""),
             "price": "--",
             "change_pct": 0.0,
             "signal": "資料取得中",
@@ -1502,6 +1649,27 @@ def generate_html():
         )
     tw_sub = " ｜ ".join(tw_parts) if tw_parts else "0=極度恐懼 100=極度貪婪"
 
+    # AI 股票洞察：依產業分組輸出
+    stock_parts = []
+    _cur_industry = None
+    for s in stocks:
+        industry = s.get("industry", "")
+        if industry and industry != _cur_industry:
+            _cur_industry = industry
+            stock_parts.append(
+                f'<div class="task-group"><strong>▍{esc_html(industry)}</strong></div>'
+            )
+        pos = f"｜{esc_html(s['position'])}" if s.get("position") else ""
+        stock_parts.append(
+            f'''
+      <div class="task-item stock-row">
+        <span class="task-name">{esc_html(s["emoji"])} {esc_html(s["name"])}{pos} {s["change_pct"]:+.2f}%｜{esc_html(s["signal"])}｜勝率{s["win_rate"]}%</span>
+        <span class="task-meta small">{esc_html(s["reason"])} / PER {esc_html(s["pe"])} / PB {esc_html(s["pb"])} / 殖利率 {esc_html(s["yield"])}%</span>
+      </div>
+      '''
+        )
+    stocks_html = "".join(stock_parts)
+
     # 美國 CPI 顯示文字
     def _pct(v):
         return f"{v:.2f}%" if isinstance(v, (int, float)) else "--"
@@ -1558,15 +1726,7 @@ body {{ font-family: Arial, "Noto Sans TC", sans-serif; padding: 24px; color: #2
 
 <div class="card tasks">
   <div class="section-title">📈 AI股票洞察</div>
-  {''.join(
-      f'''
-      <div class="task-item stock-row">
-        <span class="task-name">{esc_html(s["emoji"])} {esc_html(s["name"])} {s["change_pct"]:+.2f}%｜{esc_html(s["signal"])}｜勝率{s["win_rate"]}%</span>
-        <span class="task-meta small">{esc_html(s["reason"])} / PER {esc_html(s["pe"])} / PB {esc_html(s["pb"])} / 殖利率 {esc_html(s["yield"])}%</span>
-      </div>
-      '''
-      for s in stocks
-  )}
+  {stocks_html}
 </div>
 
 <div class="card indices">

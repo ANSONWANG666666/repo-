@@ -78,7 +78,13 @@ def parse_briefing(html_path: Path) -> dict:
             "desc": _text(w.select_one(".desc")),
         })
 
-    for item in soup.select(".tasks .task-item"):
+    for item in soup.select(".tasks .task-group, .tasks .task-item"):
+        classes = item.get("class", [])
+        if "task-group" in classes:
+            g = _text(item).lstrip("▍").strip()
+            if g:
+                result["stocks"].append({"group": g})
+            continue
         task_name = _text(item.select_one(".task-name"))
         task_meta = _text(item.select_one(".task-meta"))
         if task_name:
@@ -201,6 +207,9 @@ def build_message(data: dict) -> str:
     if data.get("stocks"):
         lines += ["╭─ 📈 *AI股票洞察*"]
         for s in data["stocks"]:
+            if s.get("group"):
+                lines.append(f"│ ▍*{esc(s['group'])}*")
+                continue
             lines.append(f"│ {esc(s['line'])}")
             if s.get("meta"):
                 lines.append(f"│ └─ {esc(s['meta'])}")
