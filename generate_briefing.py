@@ -1730,10 +1730,15 @@ def generate_html():
         )
     tw_sub = " ｜ ".join(tw_parts) if tw_parts else "0=極度恐懼 100=極度貪婪"
 
-    # AI 股票洞察：依產業分組輸出
+    # AI 股票洞察：依產業分組輸出，只顯示 🔴 強勢股與 🟡 轉折點（⚪ 隱藏，僅列統計）
+    n_red = sum(1 for s in stocks if s.get("emoji") == "🔴")
+    n_yellow = sum(1 for s in stocks if s.get("emoji") == "🟡")
+    n_hidden = len(stocks) - n_red - n_yellow
+    visible_stocks = [s for s in stocks if s.get("emoji") in ("🔴", "🟡")]
+
     stock_parts = []
     _cur_industry = None
-    for s in stocks:
+    for s in visible_stocks:
         industry = s.get("industry", "")
         if industry and industry != _cur_industry:
             _cur_industry = industry
@@ -1748,6 +1753,14 @@ def generate_html():
         <span class="task-meta small">{esc_html(s["reason"])} / PER {esc_html(s["pe"])} / PB {esc_html(s["pb"])} / 殖利率 {esc_html(s["yield"])}%{(" / " + esc_html(s["trend"])) if s.get("trend") else ""}</span>
       </div>
       '''
+        )
+    if not visible_stocks:
+        stock_parts.append(
+            f'<div class="task-item stock-row"><span class="task-name">今日 {len(stocks)} 檔皆無紅燈/黃燈訊號（整理觀察）</span></div>'
+        )
+    else:
+        stock_parts.append(
+            f'<div class="task-item stock-row"><span class="task-name">📊 全 {len(stocks)} 檔：🔴{n_red}檔／🟡{n_yellow}檔（⚪{n_hidden}檔整理觀察未列出）</span></div>'
         )
     stocks_html = "".join(stock_parts)
 
