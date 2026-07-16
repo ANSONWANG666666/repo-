@@ -52,6 +52,7 @@ def parse_briefing(html_path: Path) -> dict:
         "weather_list": [],
         "stocks": [],
         "indices": [],
+        "us_indices": [],
         "fear_greed": {"name": "", "meta": ""},
         "tw_fear_greed": {"name": "", "meta": ""},
         "us_cpi": {"title": "", "lines": [], "source": ""},
@@ -97,6 +98,11 @@ def parse_briefing(html_path: Path) -> dict:
         index_name = _text(item.select_one(".index-name"))
         if index_name:
             result["indices"].append(index_name)
+
+    for item in soup.select(".us-indices .usindex-row"):
+        index_name = _text(item.select_one(".usindex-name"))
+        if index_name:
+            result["us_indices"].append(index_name)
 
     fng_row = soup.select_one(".fear-greed .fng-row")
     if fng_row:
@@ -218,6 +224,12 @@ def build_message(data: dict) -> str:
     if data.get("indices"):
         lines += ["╭─ 🌏 *國際大盤指數*"]
         for idx in data["indices"]:
+            lines.append(f"│ {esc(idx)}")
+        lines += ["╰────────────────", ""]
+
+    if data.get("us_indices"):
+        lines += ["╭─ 🇺🇸 *美股四大指數*"]
+        for idx in data["us_indices"]:
             lines.append(f"│ {esc(idx)}")
         lines += ["╰────────────────", ""]
 

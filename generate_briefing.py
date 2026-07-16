@@ -90,6 +90,13 @@ INDICES = [
     {"name": "日股日經225", "symbol": "^N225"},
 ]
 
+US_INDICES = [
+    {"name": "道瓊指數", "symbol": "^DJI"},
+    {"name": "S&P 500", "symbol": "^GSPC"},
+    {"name": "NASDAQ", "symbol": "^IXIC"},
+    {"name": "費城半導體", "symbol": "^SOX"},
+]
+
 NEWS_TOPICS = [
     ("ai", "AI 台灣 OR 人工智慧 台灣"),
     ("youtube", "YouTube 台灣 OR Google 台灣"),
@@ -564,45 +571,42 @@ def get_stocks():
 
 
 # =========================
-# 🌏 國際大盤指數
+# 🌏 國際大盤指數（韓日 + 美股四大）
 # =========================
-def get_indices():
+def _fetch_index_quotes(index_list):
+    """以 yfinance 取得指數清單的最新價/漲跌/漲跌幅（逐檔容錯）。"""
     import sys
     result = []
     try:
         import yfinance as yf
-        for idx in INDICES:
-            try:
-                ticker = yf.Ticker(idx['symbol'])
-                info = ticker.info if hasattr(ticker, 'info') else {}
-
-                current_price = to_float(info.get("currentPrice") or info.get("regularMarketPrice"), 0)
-                change = to_float(info.get("regularMarketChange", 0), 0)
-                change_pct = to_float(info.get("regularMarketChangePercent", 0), 0)
-
-                emoji = "🔴" if change >= 0 else "🔻"
-
-                result.append({
-                    "name": idx["name"],
-                    "symbol": idx["symbol"],
-                    "price": f"{current_price:,.0f}" if current_price else "--",
-                    "change": f"{change:+.0f}" if change else "--",
-                    "change_pct": round(change_pct, 2),
-                    "emoji": emoji,
-                })
-            except Exception as e:
-                print(f"⚠️ 無法取得 {idx['name']} 數據: {type(e).__name__}", file=sys.stderr)
-                result.append({
-                    "name": idx["name"],
-                    "symbol": idx["symbol"],
-                    "price": "--",
-                    "change": "--",
-                    "change_pct": 0.0,
-                    "emoji": "⚪",
-                })
     except ImportError:
         print("⚠️ yfinance 模組未安裝，使用預設值", file=sys.stderr)
-        for idx in INDICES:
+        return [{
+            "name": idx["name"], "symbol": idx["symbol"],
+            "price": "--", "change": "--", "change_pct": 0.0, "emoji": "⚪",
+        } for idx in index_list]
+
+    for idx in index_list:
+        try:
+            ticker = yf.Ticker(idx['symbol'])
+            info = ticker.info if hasattr(ticker, 'info') else {}
+
+            current_price = to_float(info.get("currentPrice") or info.get("regularMarketPrice"), 0)
+            change = to_float(info.get("regularMarketChange", 0), 0)
+            change_pct = to_float(info.get("regularMarketChangePercent", 0), 0)
+
+            emoji = "🔴" if change >= 0 else "🔻"
+
+            result.append({
+                "name": idx["name"],
+                "symbol": idx["symbol"],
+                "price": f"{current_price:,.0f}" if current_price else "--",
+                "change": f"{change:+.0f}" if change else "--",
+                "change_pct": round(change_pct, 2),
+                "emoji": emoji,
+            })
+        except Exception as e:
+            print(f"⚠️ 無法取得 {idx['name']} 數據: {type(e).__name__}", file=sys.stderr)
             result.append({
                 "name": idx["name"],
                 "symbol": idx["symbol"],
@@ -613,6 +617,14 @@ def get_indices():
             })
 
     return result
+
+
+def get_indices():
+    return _fetch_index_quotes(INDICES)
+
+
+def get_us_indices():
+    return _fetch_index_quotes(US_INDICES)
 
 
 # =========================
@@ -1695,6 +1707,7 @@ def generate_html():
     news = get_all_news()
     stocks = get_stocks()
     indices = get_indices()
+    us_indices = get_us_indices()
     fear_greed = get_fear_greed()
     tw_fear_greed = get_tw_fear_greed()
     us_cpi = get_us_cpi()
@@ -1832,6 +1845,18 @@ body {{ font-family: Arial, "Noto Sans TC", sans-serif; padding: 24px; color: #2
       </div>
       '''
       for idx in indices
+  )}
+</div>
+
+<div class="card us-indices">
+  <div class="section-title">🇺🇸 美股四大指數</div>
+  {''.join(
+      f'''
+      <div class="usindex-row stock-row">
+        <span class="usindex-name">{esc_html(idx["emoji"])} {esc_html(idx["name"])}：{esc_html(idx["price"])} {idx["change"]} {idx["change_pct"]:+.2f}%</span>
+      </div>
+      '''
+      for idx in us_indices
   )}
 </div>
 
