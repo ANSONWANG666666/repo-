@@ -55,6 +55,7 @@ def parse_briefing(html_path: Path) -> dict:
         "us_indices": [],
         "fear_greed": {"name": "", "meta": ""},
         "tw_fear_greed": {"name": "", "meta": ""},
+        "market_light": [],
         "us_cpi": {"title": "", "lines": [], "source": ""},
         "us_econ": [],
         "biz_cycle": [],
@@ -117,6 +118,10 @@ def parse_briefing(html_path: Path) -> dict:
             "name": _text(twfng_row.select_one(".twfng-name")),
             "meta": _text(twfng_row.select_one(".twfng-meta")),
         }
+
+    light_card = soup.select_one(".market-light")
+    if light_card:
+        result["market_light"] = [_text(el) for el in light_card.select(".light-line")]
 
     cpi_card = soup.select_one(".us-cpi")
     if cpi_card:
@@ -247,6 +252,13 @@ def build_message(data: dict) -> str:
         lines.append(f"│ {esc(twfng['name'])}")
         if twfng.get("meta"):
             lines.append(f"│ └─ {esc(twfng['meta'])}")
+        lines += ["╰────────────────", ""]
+
+    ml = data.get("market_light", [])
+    if ml:
+        lines += ["╭─ 🚦 *大盤多頭紅綠燈*"]
+        for ln in ml:
+            lines.append(f"│ {esc(ln)}")
         lines += ["╰────────────────", ""]
 
     cpi = data.get("us_cpi", {})

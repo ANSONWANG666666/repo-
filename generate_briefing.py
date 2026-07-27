@@ -816,6 +816,158 @@ def get_tw_fear_greed():
         return fail
 
 
+# =========================
+# 🚦 大盤多頭趨勢紅綠燈系統（加權指數 ^TWII，7 指標交叉驗證）
+# =========================
+def _market_breadth():
+    """由 TWSE 全市場個股統計上漲/下跌家數（市場廣度）。"""
+    try:
+        rows = fetch_twse_stock_day_all()
+        up = down = 0
+        for r in rows:
+            ch = to_float(first_non_empty(r, ["Change", "漲跌價差"]), 0.0)
+            if ch > 0:
+                up += 1
+            elif ch < 0:
+                down += 1
+        if up == 0 and down == 0:
+            return None
+        return {"up": up, "down": down}
+    except Exception:
+        return None
+
+
+def get_market_traffic_light():
+    """大盤多頭趨勢紅綠燈：7 個技術指標交叉驗證，判斷現在適不適合買股票。
+
+    綠燈＝符合多頭條件(偏多)；紅燈＝不符或轉弱(警戒/偏空)。
+    綜合 5+ 綠燈＝強勢多頭、3-4＝多頭整理、2 以下＝趨勢轉弱。
+    """
+    import os
+    import sys
+    try:
+        import yfinance as yf
+
+        df = yf.Ticker("^TWII").history(period="6mo", auto_adjust=False)
+        if df is None or df.empty:
+            raise ValueError("無 ^TWII 資料")
+        # 濾掉尚未成交的當日/無量列，只用已完成交易日
+        df = df[df["Volume"] > 0]
+        if len(df) < 60:
+            raise ValueError("^TWII 歷史不足 60 日")
+
+        close = df["Close"]
+        low = df["Low"]
+        vol = df["Volume"]
+        ret = close.pct_change()
+        last_close = float(close.iloc[-1])
+
+        ma5 = close.rolling(5).mean()
+        ma10 = close.rolling(10).mean()
+        ma20 = close.rolling(20).mean()
+        ma60 = close.rolling(60).mean()
+
+        lights = []  # (名稱, 是否綠燈, 說明)
+
+        # 指標1：20MA — 股價站上 20MA 且 20MA 持續向上
+        g1 = bool(last_close > ma20.iloc[-1] and ma20.iloc[-1] > ma20.iloc[-6])
+        lights.append(("20日均線", g1,
+                       f"MA20 {ma20.iloc[-1]:,.0f}{'↑' if ma20.iloc[-1] > ma20.iloc[-6] else '↓'}"
+                       f"，股價{'站上' if last_close > ma20.iloc[-1] else '跌破'}"))
+
+        # 指標2：上升趨勢線 — 低點持續墊高(近10日低點 > 前10日低點)且未跌破
+        recent_low = float(low.iloc[-10:].min())
+        prior_low = float(low.iloc[-20:-10].min())
+        g2 = bool(recent_low >= prior_low and last_close > prior_low)
+        lights.append(("上升趨勢線", g2,
+                       f"近低{recent_low:,.0f} {'≥' if recent_low >= prior_low else '<'} 前低{prior_low:,.0f}"))
+
+        # 指標3：MACD 動能 — MACD 線(EMA12-EMA26)維持在零軸之上
+        ema12 = close.ewm(span=12, adjust=False).mean()
+        ema26 = close.ewm(span=26, adjust=False).mean()
+        macd = float((ema12 - ema26).iloc[-1])
+        g3 = bool(macd > 0)
+        lights.append(("MACD動能", g3, f"MACD {macd:+,.0f}（零軸{'之上' if macd > 0 else '之下'}）"))
+
+        # 指標4：均線多頭排列 — 5MA > 10MA > 20MA > 60MA
+        g4 = bool(ma5.iloc[-1] > ma10.iloc[-1] > ma20.iloc[-1] > ma60.iloc[-1])
+        lights.append(("均線多頭排列", g4, "5>10>20>60" if g4 else "未完全多頭排列"))
+
+        # 指標5：價量結構 — 近20日「上漲日均量 > 下跌日均量」(上漲有量、回檔縮量)
+        w = df.tail(20)
+        wret = w["Close"].pct_change()
+        up_vol = w["Volume"][wret > 0].mean()
+        dn_vol = w["Volume"][wret < 0].mean()
+        g5 = bool(up_vol > dn_vol) if (up_vol == up_vol and dn_vol == dn_vol) else False
+        lights.append(("價量結構", g5, "上漲有量、回檔縮量" if g5 else "量能未配合"))
+
+        # 指標6：市場廣度 — 全市場上漲家數 > 下跌家數
+        breadth = _market_breadth()
+        if breadth:
+            g6 = breadth["up"] > breadth["down"]
+            lights.append(("市場廣度", g6, f"漲{breadth['up']}/跌{breadth['down']}"))
+        else:
+            g6 = False
+            lights.append(("市場廣度", False, "資料暫缺"))
+
+        # 指標7：市場體感(代理) — 可用環境變數 MARKET_FEEL(1-10)手動輸入；
+        #        未設定則以「近10日做多勝率(上漲天數比例)」為代理指標
+        feel_env = os.environ.get("MARKET_FEEL", "").strip()
+        if feel_env:
+            try:
+                feel_score = float(feel_env)
+                g7 = feel_score >= 6
+                lights.append(("市場體感", g7, f"手動 {feel_score:.0f}/10"))
+            except ValueError:
+                feel_env = ""
+        if not feel_env:
+            win_rate = float((ret.tail(10) > 0).sum()) / 10.0
+            g7 = win_rate >= 0.6
+            lights.append(("市場體感(代理)", g7, f"近10日做多勝率 {win_rate * 100:.0f}%"))
+
+        green = sum(1 for _, g, _ in lights if g)
+
+        if green >= 5:
+            status, status_emoji = "強勢多頭", "🟢"
+            advice = "偏多可積極布局，順勢操作、分批進場"
+        elif green >= 3:
+            status, status_emoji = "多頭整理", "🟡"
+            advice = "觀望為主、分批布局，等多項指標同步轉綠再加碼"
+        else:
+            status, status_emoji = "趨勢轉弱", "🔴"
+            advice = "減碼收手、嚴設停損，不宜追高"
+
+        stop_ma20 = ma20.iloc[-1]
+        stop_low = recent_low
+
+        return {
+            "ok": True,
+            "index": last_close,
+            "lights": lights,
+            "green": green,
+            "total": len(lights),
+            "status": status,
+            "status_emoji": status_emoji,
+            "advice": advice,
+            "stop_ma20": float(stop_ma20),
+            "stop_low": float(stop_low),
+        }
+    except Exception as e:
+        print(f"⚠️ 無法計算大盤紅綠燈: {type(e).__name__}: {e}", file=sys.stderr)
+        return {"ok": False}
+
+
+def build_market_light_lines(m):
+    """組裝【大盤多頭紅綠燈】輸出文字。"""
+    if not m.get("ok"):
+        return ["資料取得中"]
+    lines = [f"加權指數 {m['index']:,.0f}｜{m['status_emoji']} {m['status']}（{m['green']}/{m['total']} 綠燈）"]
+    for name, g, detail in m["lights"]:
+        lines.append(f"{'🟢' if g else '🔴'} {name}：{detail}")
+    lines.append(f"👉 建議：{m['advice']}")
+    lines.append(f"🛡 參考停損：跌破 MA20({m['stop_ma20']:,.0f}) 或近10日低點({m['stop_low']:,.0f})")
+    lines.append("※ 技術分析在描述現況、非預測；多項同步轉綠可信度較高，務必做好風險管理。")
+    return lines
 
 
 # =========================
@@ -1710,6 +1862,8 @@ def generate_html():
     us_indices = get_us_indices()
     fear_greed = get_fear_greed()
     tw_fear_greed = get_tw_fear_greed()
+    market_light = get_market_traffic_light()
+    light_lines = build_market_light_lines(market_light)
     us_cpi = get_us_cpi()
     us_econ = get_us_econ()
     econ_lines = build_us_econ_lines(us_econ)
@@ -1874,6 +2028,11 @@ body {{ font-family: Arial, "Noto Sans TC", sans-serif; padding: 24px; color: #2
     <span class="twfng-name">{esc_html(tw_fear_greed["emoji"])} {esc_html(tw_fear_greed["name"])}：{esc_html(tw_fear_greed["score"])}（{esc_html(tw_fear_greed["label"])}）</span>
     <span class="twfng-meta small">{esc_html(tw_sub)}</span>
   </div>
+</div>
+
+<div class="card market-light">
+  <div class="section-title">🚦 大盤多頭紅綠燈</div>
+  {''.join(f'<div class="light-row stock-row"><span class="light-line">{esc_html(line)}</span></div>' for line in light_lines)}
 </div>
 
 <div class="card us-cpi">
