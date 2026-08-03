@@ -320,8 +320,17 @@ def fetch_tpex_valuation_index():
     return {}
 
 
+_STOCK_DAY_ALL_CACHE = []
+
+
 def fetch_twse_stock_day_all():
-    return fetch_json("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", timeout=25)
+    """TWSE 全市場個股當日行情（含記憶體快取，避免同次執行重複抓取）。"""
+    if _STOCK_DAY_ALL_CACHE:
+        return _STOCK_DAY_ALL_CACHE
+    data = fetch_json("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", timeout=25)
+    if data:
+        _STOCK_DAY_ALL_CACHE.extend(data)
+    return data
 
 
 def fetch_twse_bwibbu_all():
@@ -837,6 +846,103 @@ def _market_breadth():
         return None
 
 
+def get_margin_ratio():
+    """大盤融資維持率（扣除 ETF 資券）與融資餘額增減。
+
+    維持率 = 融資擔保品現值 ÷ 融資金額 × 100%。
+      分子：個股(排除 ETF，代號非 00 開頭) 融資今日餘額張數 × 收盤價 × 1000
+      分母：融資金額(仟元) × 依「個股現值占比」推估的個股部分
+    因 TWSE 不公布個股融資「金額」（僅張數），以個股擔保現值占比推估其融資金額；
+    ETF 佔融資現值比重低（約 6%），排除後可還原較純粹的個股融資籌碼狀態。
+    """
+    import sys
+    from datetime import datetime as _dt, timedelta as _td
+    try:
+        # 找最近一個有資料的交易日（融資資料收盤後才更新）
+        j = None
+        today = _dt.now().date()
+        for i in range(8):
+            ymd = (today - _td(days=i)).strftime("%Y%m%d")
+            url = (
+                f"https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN"
+                f"?date={ymd}&selectType=ALL&response=json"
+            )
+            try:
+                jj = fetch_json(url, timeout=25)
+            except Exception:
+                continue
+            if jj.get("stat") == "OK" and jj.get("tables"):
+                j = jj
+                used_date = f"{ymd[4:6]}/{ymd[6:8]}"
+                break
+        if not j:
+            raise ValueError("查無融資資料")
+
+        t1, t2 = j["tables"][0], j["tables"][1]
+
+        # 市場融資金額（仟元）今日/前日餘額
+        loan_today = loan_prev = None
+        for row in t1["data"]:
+            if "融資" in row[0] and "金額" in row[0]:
+                loan_prev = to_float(str(row[-2]).replace(",", ""), 0.0)
+                loan_today = to_float(str(row[-1]).replace(",", ""), 0.0)
+                break
+        if not loan_today:
+            raise ValueError("查無融資金額")
+
+        # 個股收盤價
+        price = {}
+        for r in fetch_twse_stock_day_all():
+            code = first_non_empty(r, ["Code", "股票代號"])
+            price[code] = to_float(first_non_empty(r, ["ClosingPrice", "收盤價"]), 0.0)
+
+        # 個股融資今日餘額（張）：table2 欄位 代號0 名稱1 買2 賣3 現償4 前餘5 今餘6
+        coll_all = coll_stock = 0.0
+        for r in t2["data"]:
+            code = (r[0] or "").strip()
+            bal = to_float(str(r[6]).replace(",", ""), 0.0) if len(r) > 6 else 0.0
+            p = price.get(code)
+            if bal <= 0 or not p:
+                continue
+            val = bal * p * 1000.0  # 張×現價×1000股 = 元
+            coll_all += val
+            if not code.startswith("00"):  # 排除 ETF
+                coll_stock += val
+        if coll_all <= 0:
+            raise ValueError("擔保現值為 0")
+
+        loan_yuan = loan_today * 1000.0                 # 仟元→元（全體）
+        loan_stock = loan_yuan * (coll_stock / coll_all)  # 推估個股(扣ETF)融資金額
+        ratio = coll_stock / loan_stock * 100.0 if loan_stock else 0.0
+
+        loan_today_e = loan_today / 1e5   # 仟元→億元
+        loan_prev_e = (loan_prev or loan_today) / 1e5
+        chg_e = loan_today_e - loan_prev_e
+        chg_pct = (chg_e / loan_prev_e * 100.0) if loan_prev_e else 0.0
+
+        if ratio >= 160:
+            health_emoji, health = "🟢", "健康"
+        elif ratio >= 150:
+            health_emoji, health = "🟡", "中性"
+        else:
+            health_emoji, health = "🔴", "偏低(斷頭風險升高)"
+
+        return {
+            "ok": True,
+            "date": used_date,
+            "ratio": round(ratio, 1),
+            "health_emoji": health_emoji,
+            "health": health,
+            "loan": loan_today_e,
+            "loan_chg": chg_e,
+            "loan_chg_pct": round(chg_pct, 2),
+            "etf_share": round((coll_all - coll_stock) / coll_all * 100, 1),
+        }
+    except Exception as e:
+        print(f"⚠️ 無法計算大盤融資維持率: {type(e).__name__}: {e}", file=sys.stderr)
+        return {"ok": False}
+
+
 def get_market_traffic_light():
     """大盤多頭趨勢紅綠燈：7 個技術指標交叉驗證，判斷現在適不適合買股票。
 
@@ -951,6 +1057,7 @@ def get_market_traffic_light():
             "advice": advice,
             "stop_ma20": float(stop_ma20),
             "stop_low": float(stop_low),
+            "margin": get_margin_ratio(),
         }
     except Exception as e:
         print(f"⚠️ 無法計算大盤紅綠燈: {type(e).__name__}: {e}", file=sys.stderr)
@@ -964,6 +1071,16 @@ def build_market_light_lines(m):
     lines = [f"加權指數 {m['index']:,.0f}｜{m['status_emoji']} {m['status']}（{m['green']}/{m['total']} 綠燈）"]
     for name, g, detail in m["lights"]:
         lines.append(f"{'🟢' if g else '🔴'} {name}：{detail}")
+
+    mg = m.get("margin", {})
+    if mg.get("ok"):
+        lines.append(
+            f"💰 融資維持率(扣ETF)：{mg['ratio']:.1f}% {mg['health_emoji']} {mg['health']}"
+        )
+        lines.append(
+            f"💰 融資餘額：{mg['loan']:,.0f}億（較前日 {mg['loan_chg']:+,.0f}億／{mg['loan_chg_pct']:+.1f}%）"
+        )
+
     lines.append(f"👉 建議：{m['advice']}")
     lines.append(f"🛡 參考停損：跌破 MA20({m['stop_ma20']:,.0f}) 或近10日低點({m['stop_low']:,.0f})")
     lines.append("※ 技術分析在描述現況、非預測；多項同步轉綠可信度較高，務必做好風險管理。")
