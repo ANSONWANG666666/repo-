@@ -112,10 +112,20 @@ EMAIL_ACCOUNT = "wjia.tw@gmail.com"
 EMAIL_APP_PASSWORD = None  # 從環境變數讀，不要寫死
 
 
-def fetch_json(url: str, timeout: int = 20):
-    r = requests.get(url, headers=HEADERS, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
+def fetch_json(url: str, timeout: int = 20, tries: int = 3):
+    """GET 並解析 JSON，含重試（TWSE 等端點偶發回傳 HTML/限流頁時自動重試）。"""
+    import time as _time
+    last_err = None
+    for attempt in range(tries):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_err = e
+            if attempt < tries - 1:
+                _time.sleep(2 + attempt * 2)
+    raise last_err
 
 
 def fetch_text(url: str, timeout: int = 20):
