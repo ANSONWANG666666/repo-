@@ -56,6 +56,7 @@ def parse_briefing(html_path: Path) -> dict:
         "fear_greed": {"name": "", "meta": ""},
         "tw_fear_greed": {"name": "", "meta": ""},
         "market_light": [],
+        "gold_radar": [],
         "us_cpi": {"title": "", "lines": [], "source": ""},
         "us_econ": [],
         "biz_cycle": [],
@@ -122,6 +123,10 @@ def parse_briefing(html_path: Path) -> dict:
     light_card = soup.select_one(".market-light")
     if light_card:
         result["market_light"] = [_text(el) for el in light_card.select(".light-line")]
+
+    gold_card = soup.select_one(".gold-radar")
+    if gold_card:
+        result["gold_radar"] = [_text(el) for el in gold_card.select(".gold-line")]
 
     cpi_card = soup.select_one(".us-cpi")
     if cpi_card:
@@ -258,6 +263,13 @@ def build_message(data: dict) -> str:
     if ml:
         lines += ["╭─ 🚦 *大盤多頭紅綠燈*"]
         for ln in ml:
+            lines.append(f"│ {esc(ln)}")
+        lines += ["╰────────────────", ""]
+
+    gr = data.get("gold_radar", [])
+    if gr:
+        lines += ["╭─ 🥇 *黃金多空雷達*"]
+        for ln in gr:
             lines.append(f"│ {esc(ln)}")
         lines += ["╰────────────────", ""]
 

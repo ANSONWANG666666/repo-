@@ -1098,6 +1098,330 @@ def build_market_light_lines(m):
 
 
 # =========================
+# 🥇 黃金多空雷達（Gold Bull/Bear Radar，0-100 分，資料源 FRED + yfinance）
+# =========================
+# 各指標權重（對黃金偏多程度；子分數 0-100，越高越偏多）
+GOLD_RADAR_WEIGHTS = {
+    "tech": 20, "dxy": 15, "us10y": 10, "us30y": 10,
+    "real": 15, "fed": 10, "infl": 5, "fiscal": 10, "vix": 5,
+}
+
+
+def _radar_label(score):
+    """0-100 分數轉黃金多空文字與 emoji。"""
+    if score is None:
+        return "資料不足", "⚪"
+    if score >= 85:
+        return "極強多頭", "🟢🟢"
+    if score >= 70:
+        return "強勢偏多", "🟢"
+    if score >= 56:
+        return "偏多", "🟢"
+    if score >= 45:
+        return "中性／震盪", "🟡"
+    if score >= 30:
+        return "偏空", "🔴"
+    return "強烈偏空", "🔴"
+
+
+def _wavg(pairs):
+    """加權平均，None 子分數自動排除並重新分配權重。"""
+    tot = sum(w for s, w in pairs if s is not None)
+    if tot == 0:
+        return None
+    return sum(s * w for s, w in pairs if s is not None) / tot
+
+
+def get_gold_radar():
+    """黃金多空雷達：整合黃金技術面、DXY、美債殖利率、實質殖利率、Fed、通膨、
+    財政/長債壓力、VIX，產生 0-100 分與短/中/長線判斷、Bond Stress 與交易訊號。
+    """
+    import os
+    import sys
+    try:
+        import yfinance as yf
+        import pandas as pd
+
+        # --- 市場資料（yfinance 批量）---
+        tks = ["GC=F", "DX-Y.NYB", "CL=F", "^VIX", "^MOVE"]
+        mk = yf.download(" ".join(tks), period="1y", interval="1d",
+                         progress=False, auto_adjust=False, group_by="ticker", threads=True)
+
+        def series(t):
+            try:
+                s = mk[t]["Close"].dropna()
+                return s if len(s) else None
+            except Exception:
+                return None
+
+        gold = series("GC=F")
+        if gold is None or len(gold) < 60:
+            raise ValueError("無黃金價格資料")
+        dxy = series("DX-Y.NYB")
+        oil = series("CL=F")
+        vix_s = series("^VIX")
+        move_s = series("^MOVE")
+
+        def chg20(s):
+            return float(s.iloc[-1] - s.iloc[-21]) if (s is not None and len(s) > 21) else None
+
+        # --- FRED 殖利率 ---
+        def fred_last_and_chg(sid):
+            try:
+                obs = _fred_observations(sid)
+                if len(obs) < 21:
+                    return None, None
+                return float(obs[-1][1]), float(obs[-1][1] - obs[-21][1])
+            except Exception:
+                return None, None
+
+        us10y, us10y_chg = fred_last_and_chg("DGS10")
+        us30y, us30y_chg = fred_last_and_chg("DGS30")
+        real, real_chg = fred_last_and_chg("DFII10")
+        try:
+            spread = _fred_latest("T10Y2Y")[1]
+        except Exception:
+            spread = None
+
+        # === 黃金技術面 ===
+        gp_env = os.environ.get("GOLD_PRICE", "").strip()
+        gold_price = to_float(gp_env, 0) if gp_env else float(gold.iloc[-1])
+        if not gold_price:
+            gold_price = float(gold.iloc[-1])
+        ma5 = float(gold.rolling(5).mean().iloc[-1])
+        ma20 = float(gold.rolling(20).mean().iloc[-1])
+        ma60 = float(gold.rolling(60).mean().iloc[-1])
+        ma200 = float(gold.rolling(200).mean().iloc[-1]) if len(gold) >= 200 else None
+        # RSI(14)
+        delta = gold.diff()
+        gainm = delta.clip(lower=0).rolling(14).mean()
+        lossm = (-delta.clip(upper=0)).rolling(14).mean()
+        rsi = float((100 - 100 / (1 + gainm / lossm.replace(0, 1e-9))).iloc[-1])
+        # MACD
+        ema12 = gold.ewm(span=12, adjust=False).mean()
+        ema26 = gold.ewm(span=26, adjust=False).mean()
+        macd = float((ema12 - ema26).iloc[-1])
+        macd_sig = float((ema12 - ema26).ewm(span=9, adjust=False).mean().iloc[-1])
+        macd_up = macd > macd_sig
+        # ATR(14)
+        hi, lo, cl = mk["GC=F"]["High"], mk["GC=F"]["Low"], mk["GC=F"]["Close"]
+        tr = pd.concat([hi - lo, (hi - cl.shift()).abs(), (lo - cl.shift()).abs()], axis=1).max(axis=1)
+        atr = float(tr.rolling(14).mean().iloc[-1])
+
+        tech_conds = [
+            gold_price > ma20, gold_price > ma60,
+            (ma200 is not None and gold_price > ma200),
+            ma5 > ma20, ma20 > ma60, macd > 0,
+        ]
+        tech_score = 25 + 12.5 * sum(1 for c in tech_conds if c)
+        tech_score = clamp(tech_score, 0, 100)
+
+        # === DXY（美元；下跌利多黃金）===
+        dxy_chg = chg20(dxy)
+        dxy_now = float(dxy.iloc[-1]) if dxy is not None else None
+        dxy_chg_pct = (dxy_chg / dxy.iloc[-21] * 100) if (dxy_chg is not None) else None
+        dxy_score = clamp(50 - dxy_chg_pct * 12, 0, 100) if dxy_chg_pct is not None else None
+
+        # === 美債殖利率（含財政情境修正）===
+        dxy_down = (dxy_chg is not None and dxy_chg < 0)
+        us10y_score = None
+        if us10y_chg is not None:
+            us10y_score = clamp(50 - us10y_chg * 100, 0, 100)
+            if us10y_chg > 0 and dxy_down:   # 殖利率↑但美元↓＝財政風險，非單純利空
+                us10y_score = clamp(us10y_score + 18, 0, 100)
+        us30y_score = None
+        if us30y_chg is not None:
+            us30y_score = clamp(50 - us30y_chg * 100, 0, 100)
+            if us30y_chg > 0 and dxy_down:
+                us30y_score = clamp(us30y_score + 22, 0, 100)
+
+        # === 實質殖利率（下降＝黃金利多，高權重）===
+        real_score = clamp(50 - real_chg * 120, 0, 100) if real_chg is not None else None
+
+        # === Fed 政策（近一次決策方向）===
+        fed_score = None
+        try:
+            up = _fred_observations("DFEDTARU")
+            _, prev_up, _ = _fred_last_change(up)
+            delta_y = up[-1][1] - prev_up if prev_up is not None else 0
+            fed_score = 70 if delta_y < 0 else (30 if delta_y > 0 else 50)  # 降息利多/升息利空
+        except Exception:
+            pass
+
+        # === 通膨（偏高＝黃金抗通膨；加速再加分）===
+        infl_score = None
+        try:
+            cpi = _fred_series("CPIAUCNS")
+            cm = sorted(cpi)
+            cpi_now, cpi_prev = _yoy(cpi, cm[-1]), _yoy(cpi, cm[-2])
+            if cpi_now is not None:
+                infl_score = 50 + (10 if cpi_now >= 3 else 0)
+                if cpi_prev is not None and cpi_now > cpi_prev:
+                    infl_score += 5
+                infl_score = clamp(infl_score, 0, 100)
+        except Exception:
+            pass
+
+        # === 財政/長債壓力（長債高且上升＝中長線利多黃金）===
+        fiscal_score = None
+        if us30y is not None:
+            fiscal_score = 50
+            fiscal_score += clamp((us30y - 4.5) * 60, 0, 30)      # 長債絕對水位高
+            if us30y_chg is not None:
+                fiscal_score += clamp(us30y_chg * 80, -10, 20)    # 長債快速上升
+            if move_s is not None and float(move_s.iloc[-1]) > 90:
+                fiscal_score += 8                                  # 債市波動大
+            fiscal_score = clamp(fiscal_score, 0, 100)
+
+        # === VIX（風險趨避；升高＝避險利多黃金，權重低）===
+        vix_now = float(vix_s.iloc[-1]) if vix_s is not None else None
+        vix_score = clamp(40 + (vix_now - 20) * 1.5, 0, 100) if vix_now is not None else None
+
+        subs = {
+            "tech": tech_score, "dxy": dxy_score, "us10y": us10y_score, "us30y": us30y_score,
+            "real": real_score, "fed": fed_score, "infl": infl_score,
+            "fiscal": fiscal_score, "vix": vix_score,
+        }
+        W = GOLD_RADAR_WEIGHTS
+
+        def score_with(weights):
+            return _wavg([(subs[k], weights.get(k, 0)) for k in subs])
+
+        final = score_with(W)
+        # 三週期：短線重技術/美元、長線重財政/實質殖利率
+        short = score_with({"tech": 35, "dxy": 20, "us10y": 10, "real": 10, "vix": 10,
+                            "us30y": 5, "fed": 5, "fiscal": 5})
+        medium = final
+        long_ = score_with({"fiscal": 25, "real": 20, "us30y": 15, "fed": 10, "tech": 10,
+                            "dxy": 10, "infl": 5, "us10y": 5})
+
+        # === Bond Stress Index (0-100) ===
+        bond_stress = None
+        try:
+            comps = []
+            if move_s is not None:
+                comps.append((clamp((float(move_s.iloc[-1]) - 50) / 1.2, 0, 100), 0.25))
+            if us30y is not None:
+                comps.append((clamp((us30y - 4.5) * 80, 0, 100), 0.30))
+            if us30y_chg is not None:
+                comps.append((clamp(us30y_chg * 300, 0, 100), 0.25))
+            if us10y_chg is not None:
+                comps.append((clamp(us10y_chg * 300, 0, 100), 0.10))
+            if spread is not None:
+                comps.append((clamp(-spread * 80, 0, 100), 0.10))  # 倒掛才加壓
+            bond_stress = _wavg(comps)
+        except Exception:
+            pass
+
+        # === 交易訊號 ===
+        tech_confirm = sum(1 for c in tech_conds if c)
+        if final is not None and final >= 70 and tech_confirm >= 3:
+            signal = "🟢 BUY（偏多）"
+        elif (final is not None and final <= 44 and dxy_chg is not None and dxy_chg > 0
+              and real_chg is not None and real_chg > 0 and gold_price < ma20):
+            signal = "🔴 SELL／REDUCE（偏空）"
+        else:
+            signal = "🟡 WAIT（觀望）"
+
+        # === 價位（支撐/壓力/停損）===
+        hi60 = float(gold.tail(60).max())
+        lo60 = float(gold.tail(60).min())
+        hi20 = float(gold.tail(20).max())
+        lo20 = float(gold.tail(20).min())
+
+        def _dir(chgv, up_bull):
+            """chgv 正負轉方向文字；up_bull=True 表示上升對黃金偏多。"""
+            if chgv is None:
+                return "N/A", "⚪"
+            if abs(chgv) < 1e-9:
+                return "持平", "🟡"
+            rising = chgv > 0
+            bull = rising if up_bull else (not rising)
+            return ("上升" if rising else "下降"), ("🟢" if bull else "🔴")
+
+        return {
+            "ok": True,
+            "gold": gold_price,
+            "gold_chg_pct": round((gold.iloc[-1] / gold.iloc[-2] - 1) * 100, 2),
+            "final": round(final) if final is not None else None,
+            "short": round(short) if short is not None else None,
+            "medium": round(medium) if medium is not None else None,
+            "long": round(long_) if long_ is not None else None,
+            "ma20": ma20, "ma60": ma60, "ma200": ma200,
+            "rsi": round(rsi, 1), "macd_up": macd_up, "macd": macd,
+            "atr": atr,
+            "r1": hi20, "r2": hi60, "s1": ma20, "s2": lo20,
+            "stop": gold_price - 2 * atr,
+            "dxy": dxy_now, "dxy_dir": _dir(dxy_chg, up_bull=False),
+            "us10y": us10y, "us10y_dir": _dir(us10y_chg, up_bull=False),
+            "us30y": us30y, "us30y_dir": _dir(us30y_chg, up_bull=False),
+            "real": real, "real_dir": _dir(real_chg, up_bull=False),
+            "oil": float(oil.iloc[-1]) if oil is not None else None,
+            "vix": vix_now,
+            "bond_stress": round(bond_stress) if bond_stress is not None else None,
+            "signal": signal,
+            "gold_price_manual": bool(gp_env),
+        }
+    except Exception as e:
+        print(f"⚠️ 無法計算黃金多空雷達: {type(e).__name__}: {e}", file=sys.stderr)
+        return {"ok": False}
+
+
+def _bond_stress_label(v):
+    if v is None:
+        return "N/A", "⚪"
+    if v <= 30:
+        return "債券市場正常", "🟢"
+    if v <= 50:
+        return "輕度壓力", "🟡"
+    if v <= 70:
+        return "明顯壓力", "🟠"
+    if v <= 85:
+        return "債券發作", "🔴"
+    return "系統性風險", "🚨"
+
+
+def build_gold_radar_lines(r):
+    """組裝【黃金多空雷達】輸出文字。"""
+    if not r.get("ok"):
+        return ["資料取得中"]
+    label, emoji = _radar_label(r["final"])
+
+    def na(v, fmt="{:.2f}"):
+        return fmt.format(v) if isinstance(v, (int, float)) else "N/A"
+
+    lines = []
+    price_tag = "（手動輸入）" if r.get("gold_price_manual") else ""
+    lines.append(f"💰 黃金 {r['gold']:,.0f}{price_tag}（{r['gold_chg_pct']:+.2f}%）｜🎯 {r['final']}/100 {emoji} {label}")
+
+    def tf(v):
+        _, e = _radar_label(v)
+        return f"{v} {e}" if v is not None else "N/A"
+    lines.append(f"三週期→ 短線 {tf(r['short'])}｜中線 {tf(r['medium'])}｜長線 {tf(r['long'])}")
+
+    # 關鍵驅動
+    d = r["dxy_dir"]; lines.append(f"💵 DXY {na(r['dxy'])}：{d[0]} {d[1]}")
+    d = r["us10y_dir"]; lines.append(f"🇺🇸 US10Y {na(r['us10y'])}%：{d[0]} {d[1]}")
+    d = r["us30y_dir"]; lines.append(f"🇺🇸 US30Y {na(r['us30y'])}%：{d[0]} {d[1]}")
+    d = r["real_dir"]; lines.append(f"📈 實質殖利率 {na(r['real'])}%：{d[0]} {d[1]}")
+    lines.append(f"🛢 油價 {na(r['oil'],'{:.1f}')}｜📉 VIX {na(r['vix'],'{:.1f}')}")
+
+    bs_label, bs_emoji = _bond_stress_label(r["bond_stress"])
+    if r["bond_stress"] is not None:
+        lines.append(f"🔥 Bond Stress {r['bond_stress']}/100 {bs_emoji} {bs_label}")
+
+    # 技術面 / 價位
+    macd_e = "🟢" if r["macd_up"] else "🔴"
+    ma200 = f"{r['ma200']:,.0f}" if r["ma200"] else "N/A"
+    lines.append(f"🎯 MA20 {r['ma20']:,.0f}／MA60 {r['ma60']:,.0f}／MA200 {ma200}｜RSI {r['rsi']:.0f}｜MACD {macd_e}")
+    lines.append(f"壓力 R1 {r['r1']:,.0f}／R2 {r['r2']:,.0f}｜支撐 S1 {r['s1']:,.0f}／S2 {r['s2']:,.0f}")
+    lines.append(f"🛡 建議停損 ≈ {r['stop']:,.0f}（2×ATR，ATR {r['atr']:,.0f}）")
+    lines.append(f"🚦 訊號：{r['signal']}")
+    lines.append("※ 本雷達為市場分析與風險監控，非保證獲利或自動下單；請自行控管風險。")
+    return lines
+
+
+# =========================
 # 🇺🇸 美國消費者物價指數 CPI（資料來源：FRED / 美國勞工統計局）
 # =========================
 _FRED_CACHE = {}
@@ -1991,6 +2315,8 @@ def generate_html():
     tw_fear_greed = get_tw_fear_greed()
     market_light = get_market_traffic_light()
     light_lines = build_market_light_lines(market_light)
+    gold_radar = get_gold_radar()
+    gold_lines = build_gold_radar_lines(gold_radar)
     us_cpi = get_us_cpi()
     us_econ = get_us_econ()
     econ_lines = build_us_econ_lines(us_econ)
@@ -2160,6 +2486,11 @@ body {{ font-family: Arial, "Noto Sans TC", sans-serif; padding: 24px; color: #2
 <div class="card market-light">
   <div class="section-title">🚦 大盤多頭紅綠燈</div>
   {''.join(f'<div class="light-row stock-row"><span class="light-line">{esc_html(line)}</span></div>' for line in light_lines)}
+</div>
+
+<div class="card gold-radar">
+  <div class="section-title">🥇 黃金多空雷達</div>
+  {''.join(f'<div class="gold-row stock-row"><span class="gold-line">{esc_html(line)}</span></div>' for line in gold_lines)}
 </div>
 
 <div class="card us-cpi">
