@@ -7,8 +7,32 @@ on:
     - cron: '30 23 * * *'
   workflow_dispatch:
 
+permissions:
+  contents: read
+  actions: read
+
 jobs:
+  # 外部排程（cron-job.org）準時觸發；GitHub 自己的排程只當備援，今天已成功跑過就跳過，避免重複推播
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then echo "skip=false" >> "$GITHUB_OUTPUT"; exit 0; fi
+          today=$(TZ=Asia/Taipei date +%F)
+          n=$(gh api "repos/${{ github.repository }}/actions/workflows/morning_briefing.yml/runs?status=success&per_page=20" \
+            --jq "[.workflow_runs[] | select((.created_at | fromdate + 28800 | strftime(\"%Y-%m-%d\")) == \"$today\")] | length")
+          echo "今天（$today）已成功執行 $n 次"
+          if [ "${n:-0}" -gt 0 ]; then echo "skip=true" >> "$GITHUB_OUTPUT"; else echo "skip=false" >> "$GITHUB_OUTPUT"; fi
+
   run:
+    needs: guard
+    if: needs.guard.outputs.skip != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
