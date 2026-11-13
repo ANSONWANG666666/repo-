@@ -62,5 +62,5 @@ jobs:
       - name: Send Telegram
         run: python send_morning_briefing_telegram.py
         env:
-          BOT_TOKEN: ${{ secrets.TG_TOKEN_DAWN || secrets.BOT_TOKEN }}
+          BOT_TOKEN: ${{ secrets.TG_TOKEN_DAWN || secrets.TG_TOKEN_SUNNY || secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
